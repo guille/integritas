@@ -807,8 +807,8 @@ mod tests {
         // Add more files to exercise parallelism
         for i in 0..20 {
             fs::write(
-                dir.path().join(format!("par_{}.txt", i)),
-                format!("data {}", i).as_bytes(),
+                dir.path().join(format!("par_{i}.txt")),
+                format!("data {i}").as_bytes(),
             )
             .unwrap();
         }
@@ -822,7 +822,7 @@ mod tests {
                 .entries
                 .get(path)
                 .expect("missing in parallel result");
-            assert_eq!(entry.hash, par_entry.hash, "hash mismatch for {}", path);
+            assert_eq!(entry.hash, par_entry.hash, "hash mismatch for {path}");
             assert_eq!(entry.size, par_entry.size);
         }
     }

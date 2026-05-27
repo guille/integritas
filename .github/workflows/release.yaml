@@ -46,7 +46,6 @@ jobs:
           OUTDIR="dist/integritas_${VERSION}_linux_amd64"
           mkdir -p "$OUTDIR"
           cp target/release/integritas "$OUTDIR/"
-          cp git-integritas "$OUTDIR/"
           tar czf "${OUTDIR}.tar.gz" -C dist "integritas_${VERSION}_linux_amd64"
 
           cd dist

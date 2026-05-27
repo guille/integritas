@@ -145,7 +145,9 @@ mod tests {
     #[test]
     fn test_hash_large_file_rayon() {
         // Create a file > RAYON_THRESHOLD (1 MiB)
-        let data: Vec<u8> = (0..2_000_000u64).map(|i| (i % 256) as u8).collect();
+        let data: Vec<u8> = (0..2_000_000u64)
+            .map(|i| u8::try_from(i % 256).unwrap())
+            .collect();
         let expected = hash_bytes(&data);
 
         let mut tmp = NamedTempFile::new().unwrap();

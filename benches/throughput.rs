@@ -4,7 +4,7 @@ use std::io::Write;
 use tempfile::TempDir;
 
 fn create_file(dir: &std::path::Path, name: &str, size: usize) {
-    let data: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
+    let data: Vec<u8> = (0..size).map(|i| u8::try_from(i % 256).unwrap()).collect();
     let mut f = fs::File::create(dir.join(name)).unwrap();
     f.write_all(&data).unwrap();
 }
@@ -22,7 +22,7 @@ fn bench_hash_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("hash_file");
 
     for (size, label) in sizes {
-        let filename = format!("test_{}.bin", label);
+        let filename = format!("test_{label}.bin");
         create_file(dir.path(), &filename, *size);
         let path = dir.path().join(&filename);
 
@@ -47,7 +47,7 @@ fn bench_many_files(c: &mut Criterion) {
 
     // Create 100 x 4KB files
     for i in 0..100 {
-        create_file(dir.path(), &format!("file_{}.bin", i), 4096);
+        create_file(dir.path(), &format!("file_{i}.bin"), 4096);
     }
 
     let mut group = c.benchmark_group("compute");
