@@ -1,9 +1,10 @@
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use integritas::manifest;
+use std::fmt::Display;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process;
+use std::process::ExitCode;
 
 #[derive(Parser)]
 #[command(
@@ -102,10 +103,48 @@ enum Commands {
     },
 }
 
-fn main() {
-    let cli = Cli::parse();
+/// An application-level error carrying a user-facing message.
+///
+/// Command functions return these instead of calling `process::exit`, so
+/// `main` is the single place that prints to stderr and picks a failure code.
+#[derive(Debug)]
+struct AppError(String);
 
-    match cli.command {
+impl Display for AppError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AppError {}
+
+/// Attach a user-facing context message to any `Result` whose error is `Display`.
+///
+/// The context string is only formatted on the error path, so passing a `&str`
+/// literal here is free on success.
+trait Context<T> {
+    fn context(self, ctx: impl Display) -> Result<T, AppError>;
+}
+
+impl<T, E: Display> Context<T> for Result<T, E> {
+    fn context(self, ctx: impl Display) -> Result<T, AppError> {
+        self.map_err(|e| AppError(format!("{ctx}: {e}")))
+    }
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    match run(cli.command) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run(command: Commands) -> Result<ExitCode, AppError> {
+    match command {
         Commands::Compute {
             directory,
             output,
@@ -113,295 +152,268 @@ fn main() {
             exclude,
             threads,
             quiet,
-        } => {
-            let dir = &directory;
-            if !dir.is_dir() {
-                eprintln!("Error: '{}' is not a directory", dir.display());
-                process::exit(1);
-            }
-
-            // Helper: create a spinner progress bar (hidden if quiet)
-            let make_spinner = || -> ProgressBar {
-                if quiet {
-                    ProgressBar::hidden()
-                } else {
-                    let pb = ProgressBar::new_spinner();
-                    pb.set_style(
-                        ProgressStyle::with_template(
-                            "{spinner:.green} [{elapsed_precise}] {pos} files hashed",
-                        )
-                        .unwrap(),
-                    );
-                    pb
-                }
-            };
-
-            let out_path = output.unwrap_or_else(|| manifest::manifest_path(dir));
-
-            let result = if append {
-                let existing = if out_path.exists() {
-                    match manifest::Manifest::load(&out_path) {
-                        Ok(m) => {
-                            if !quiet {
-                                eprintln!(
-                                    "Appending to existing manifest ({} entries, threads: {threads})",
-                                    m.entries.len(),
-                                );
-                            }
-                            Some(m)
-                        }
-                        Err(e) => {
-                            eprintln!("Error reading existing manifest: {e}");
-                            process::exit(1);
-                        }
-                    }
-                } else {
-                    if !quiet {
-                        eprintln!(
-                            "No existing manifest found, computing from scratch (threads: {threads})",
-                        );
-                    }
-                    None
-                };
-                let pb = make_spinner();
-                let result =
-                    manifest::compute_append(dir, existing.as_ref(), threads, &exclude, Some(&pb));
-                pb.finish_and_clear();
-                result
-            } else {
-                if !quiet {
-                    eprintln!(
-                        "Computing hashes for: {} (threads: {threads})",
-                        dir.display(),
-                    );
-                }
-                let pb = make_spinner();
-                let result = manifest::compute_with_threads(dir, threads, Some(&pb), &exclude);
-                pb.finish_and_clear();
-                result
-            };
-
-            match result {
-                Ok(m) => {
-                    let count = m.entries.len();
-                    if let Err(e) = m.save(&out_path) {
-                        eprintln!("Error writing manifest: {e}");
-                        process::exit(1);
-                    }
-                    if !quiet {
-                        eprintln!(
-                            "Manifest written to: {} ({count} files)",
-                            out_path.display()
-                        );
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Error computing hashes: {e}");
-                    process::exit(1);
-                }
-            }
-        }
+        } => cmd_compute(&directory, output, append, &exclude, threads, quiet),
         Commands::Check {
             directory,
-            manifest: manifest_path_arg,
+            manifest,
             report,
             prompt,
             threads,
             quiet,
-        } => {
-            let dir = &directory;
-            if !dir.is_dir() {
-                eprintln!("Error: '{}' is not a directory", dir.display());
-                process::exit(1);
-            }
+        } => cmd_check(&directory, manifest, report.as_deref(), prompt, threads, quiet),
+        Commands::Diff { old, new, quiet } => cmd_diff(&old, &new, quiet),
+    }
+}
 
-            // Helper: create a spinner progress bar (hidden if quiet)
-            let make_spinner = || -> ProgressBar {
-                if quiet {
-                    ProgressBar::hidden()
-                } else {
-                    let pb = ProgressBar::new_spinner();
-                    pb.set_style(
-                        ProgressStyle::with_template(
-                            "{spinner:.green} [{elapsed_precise}] {pos} files hashed",
-                        )
-                        .unwrap(),
-                    );
-                    pb
-                }
-            };
+/// Create a spinner progress bar (hidden when `quiet`).
+fn make_spinner(quiet: bool) -> ProgressBar {
+    if quiet {
+        ProgressBar::hidden()
+    } else {
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(
+            ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] {pos} files hashed")
+                .unwrap(),
+        );
+        pb
+    }
+}
 
-            let mpath = manifest_path_arg.unwrap_or_else(|| manifest::manifest_path(dir));
-            if !mpath.exists() {
-                eprintln!("Error: manifest not found at '{}'", mpath.display());
-                eprintln!("Run 'integritas compute' first to create a manifest.");
-                process::exit(1);
-            }
+fn cmd_compute(
+    dir: &std::path::Path,
+    output: Option<PathBuf>,
+    append: bool,
+    exclude: &[String],
+    threads: usize,
+    quiet: bool,
+) -> Result<ExitCode, AppError> {
+    if !dir.is_dir() {
+        return Err(AppError(format!("'{}' is not a directory", dir.display())));
+    }
 
-            let m = match manifest::Manifest::load(&mpath) {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("Error reading manifest: {e}");
-                    process::exit(1);
-                }
-            };
+    let out_path = output.unwrap_or_else(|| manifest::manifest_path(dir));
 
+    let manifest = if append {
+        let existing = if out_path.exists() {
+            let m = manifest::Manifest::load(&out_path).context("reading existing manifest")?;
             if !quiet {
                 eprintln!(
-                    "Verifying: {} ({} entries, threads: {threads})",
-                    dir.display(),
-                    m.entries.len()
+                    "Appending to existing manifest ({} entries, threads: {threads})",
+                    m.entries.len(),
                 );
             }
-
-            let pb = if quiet {
-                ProgressBar::hidden()
-            } else {
-                let pb = ProgressBar::new(m.entries.len() as u64);
-                pb.set_style(
-                    ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
-                        .unwrap()
-                        .progress_chars("#>-"),
-                );
-                pb
-            };
-
-            match manifest::check_with_threads(dir, &m, threads, Some(&pb)) {
-                Ok(summary) => {
-                    pb.finish_and_clear();
-                    for path in &summary.changed {
-                        println!("CHANGED: {path}");
-                    }
-                    for path in &summary.missing {
-                        println!("MISSING: {path}");
-                    }
-                    for path in &summary.new {
-                        println!("NEW:     {path}");
-                    }
-
-                    if !quiet {
-                        eprintln!(
-                            "\nSummary: {} ok, {} changed, {} missing, {} new",
-                            summary.ok,
-                            summary.changed.len(),
-                            summary.missing.len(),
-                            summary.new.len()
-                        );
-                    }
-
-                    if let Some(ref report_path) = report {
-                        let html = integritas::report::generate_html(dir, &summary, threads)
-                            .expect("failed to generate report");
-                        if let Err(e) = std::fs::write(report_path, html) {
-                            eprintln!("Error writing report: {e}");
-                            process::exit(1);
-                        }
-                        if !quiet {
-                            eprintln!("Report written to: {}", report_path.display());
-                        }
-                    }
-
-                    let has_differences = !summary.changed.is_empty()
-                        || !summary.missing.is_empty()
-                        || !summary.new.is_empty();
-
-                    // Prompt to update manifest if --prompt and there are differences
-                    if prompt && has_differences {
-                        eprint!("\nUpdate manifest to reflect current state? [y/N] ");
-                        let _ = std::io::stderr().flush();
-                        let mut input = String::new();
-                        if std::io::stdin().read_line(&mut input).is_ok()
-                            && input.trim().eq_ignore_ascii_case("y")
-                        {
-                            let new_pb = make_spinner();
-                            match manifest::build_updated_manifest(
-                                dir,
-                                &summary,
-                                &m,
-                                threads,
-                                Some(&new_pb),
-                            ) {
-                                Ok(updated) => {
-                                    new_pb.finish_and_clear();
-                                    let count = updated.entries.len();
-                                    if let Err(e) = updated.save(&mpath) {
-                                        eprintln!("Error writing manifest: {e}");
-                                        process::exit(1);
-                                    }
-                                    if !quiet {
-                                        eprintln!(
-                                            "Manifest updated: {} ({count} files)",
-                                            mpath.display()
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    new_pb.finish_and_clear();
-                                    eprintln!("Error updating manifest: {e}");
-                                    process::exit(1);
-                                }
-                            }
-                        } else if !quiet {
-                            eprintln!("Manifest not updated.");
-                        }
-                    }
-
-                    if has_differences {
-                        process::exit(1);
-                    } else {
-                        process::exit(0);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Error during verification: {e}");
-                    process::exit(1);
-                }
-            }
-        }
-        Commands::Diff { old, new, quiet } => {
-            let old_manifest = match manifest::Manifest::load(&old) {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("Error reading old manifest '{}': {}", old.display(), e);
-                    process::exit(1);
-                }
-            };
-            let new_manifest = match manifest::Manifest::load(&new) {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("Error reading new manifest '{}': {}", new.display(), e);
-                    process::exit(1);
-                }
-            };
-
-            let summary = manifest::diff(&old_manifest, &new_manifest);
-
-            for path in &summary.added {
-                println!("ADDED:   {path}");
-            }
-            for path in &summary.removed {
-                println!("REMOVED: {path}");
-            }
-            for path in &summary.changed {
-                println!("CHANGED: {path}");
-            }
-
+            Some(m)
+        } else {
             if !quiet {
                 eprintln!(
-                    "\nSummary: {} unchanged, {} changed, {} added, {} removed",
-                    summary.unchanged,
-                    summary.changed.len(),
-                    summary.added.len(),
-                    summary.removed.len()
+                    "No existing manifest found, computing from scratch (threads: {threads})",
                 );
             }
-
-            if summary.changed.is_empty() && summary.added.is_empty() && summary.removed.is_empty()
-            {
-                process::exit(0);
-            } else {
-                process::exit(1);
-            }
+            None
+        };
+        let pb = make_spinner(quiet);
+        let result =
+            manifest::compute_append(dir, existing.as_ref(), threads, exclude, Some(&pb));
+        pb.finish_and_clear();
+        result.context("computing hashes")?
+    } else {
+        if !quiet {
+            eprintln!("Computing hashes for: {} (threads: {threads})", dir.display());
         }
+        let pb = make_spinner(quiet);
+        let result = manifest::compute_with_threads(dir, threads, Some(&pb), exclude);
+        pb.finish_and_clear();
+        result.context("computing hashes")?
+    };
+
+    let count = manifest.entries.len();
+    manifest.save(&out_path).context("writing manifest")?;
+    if !quiet {
+        eprintln!("Manifest written to: {} ({count} files)", out_path.display());
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_check(
+    dir: &std::path::Path,
+    manifest_path_arg: Option<PathBuf>,
+    report: Option<&std::path::Path>,
+    prompt: bool,
+    threads: usize,
+    quiet: bool,
+) -> Result<ExitCode, AppError> {
+    if !dir.is_dir() {
+        return Err(AppError(format!("'{}' is not a directory", dir.display())));
+    }
+
+    let mpath = manifest_path_arg.unwrap_or_else(|| manifest::manifest_path(dir));
+    if !mpath.exists() {
+        return Err(AppError(format!(
+            "manifest not found at '{}'\nRun 'integritas compute' first to create a manifest.",
+            mpath.display()
+        )));
+    }
+
+    let m = manifest::Manifest::load(&mpath).context("reading manifest")?;
+
+    if !quiet {
+        eprintln!(
+            "Verifying: {} ({} entries, threads: {threads})",
+            dir.display(),
+            m.entries.len()
+        );
+    }
+
+    let pb = if quiet {
+        ProgressBar::hidden()
+    } else {
+        let pb = ProgressBar::new(m.entries.len() as u64);
+        pb.set_style(
+            ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+        pb
+    };
+
+    let summary = manifest::check_with_threads(dir, &m, threads, Some(&pb))
+        .inspect_err(|_| pb.finish_and_clear())
+        .context("during verification")?;
+    pb.finish_and_clear();
+
+    for path in &summary.changed {
+        println!("CHANGED: {path}");
+    }
+    for path in &summary.missing {
+        println!("MISSING: {path}");
+    }
+    for path in &summary.new {
+        println!("NEW:     {path}");
+    }
+
+    if !quiet {
+        eprintln!(
+            "\nSummary: {} ok, {} changed, {} missing, {} new",
+            summary.ok,
+            summary.changed.len(),
+            summary.missing.len(),
+            summary.new.len()
+        );
+    }
+
+    if let Some(report_path) = report {
+        let html =
+            integritas::report::generate_html(dir, &summary, threads).context("generating report")?;
+        std::fs::write(report_path, html).context("writing report")?;
+        if !quiet {
+            eprintln!("Report written to: {}", report_path.display());
+        }
+    }
+
+    let has_differences = !summary.changed.is_empty()
+        || !summary.missing.is_empty()
+        || !summary.new.is_empty();
+
+    // Prompt to update the manifest if --prompt and there are differences.
+    let mut manifest_updated = false;
+    if prompt && has_differences {
+        eprint!("\nUpdate manifest to reflect current state? [y/N] ");
+        let _ = std::io::stderr().flush();
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input).is_ok()
+            && input.trim().eq_ignore_ascii_case("y")
+        {
+            let new_pb = make_spinner(quiet);
+            let updated = manifest::build_updated_manifest(dir, &summary, &m, threads, Some(&new_pb))
+                .inspect_err(|_| new_pb.finish_and_clear())
+                .context("updating manifest")?;
+            new_pb.finish_and_clear();
+            let count = updated.entries.len();
+            updated.save(&mpath).context("writing manifest")?;
+            if !quiet {
+                eprintln!("Manifest updated: {} ({count} files)", mpath.display());
+            }
+            manifest_updated = true;
+        } else if !quiet {
+            eprintln!("Manifest not updated.");
+        }
+    }
+
+    Ok(check_exit_code(has_differences, manifest_updated))
+}
+
+fn cmd_diff(old: &std::path::Path, new: &std::path::Path, quiet: bool) -> Result<ExitCode, AppError> {
+    let old_manifest = manifest::Manifest::load(old)
+        .context(format!("reading old manifest '{}'", old.display()))?;
+    let new_manifest = manifest::Manifest::load(new)
+        .context(format!("reading new manifest '{}'", new.display()))?;
+
+    let summary = manifest::diff(&old_manifest, &new_manifest);
+
+    for path in &summary.added {
+        println!("ADDED:   {path}");
+    }
+    for path in &summary.removed {
+        println!("REMOVED: {path}");
+    }
+    for path in &summary.changed {
+        println!("CHANGED: {path}");
+    }
+
+    if !quiet {
+        eprintln!(
+            "\nSummary: {} unchanged, {} changed, {} added, {} removed",
+            summary.unchanged,
+            summary.changed.len(),
+            summary.added.len(),
+            summary.removed.len()
+        );
+    }
+
+    let identical =
+        summary.changed.is_empty() && summary.added.is_empty() && summary.removed.is_empty();
+    Ok(if identical {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+/// Decide the exit code for a `check` run.
+///
+/// Differences yield a failure code, *unless* the manifest was just updated to
+/// reflect the current state — in that case the directory matches the manifest
+/// again, so the run succeeds.
+fn check_exit_code(has_differences: bool, manifest_updated: bool) -> ExitCode {
+    if has_differences && !manifest_updated {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ExitCode doesn't implement PartialEq, so compare via the debug repr.
+    fn code(c: ExitCode) -> String {
+        format!("{c:?}")
+    }
+
+    #[test]
+    fn clean_run_succeeds() {
+        assert_eq!(code(check_exit_code(false, false)), code(ExitCode::SUCCESS));
+    }
+
+    #[test]
+    fn differences_without_update_fail() {
+        assert_eq!(code(check_exit_code(true, false)), code(ExitCode::FAILURE));
+    }
+
+    #[test]
+    fn differences_with_successful_update_succeed() {
+        // Regression: --prompt accepted and manifest saved must exit 0.
+        assert_eq!(code(check_exit_code(true, true)), code(ExitCode::SUCCESS));
     }
 }
