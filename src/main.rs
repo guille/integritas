@@ -160,7 +160,14 @@ fn run(command: Commands) -> Result<ExitCode, AppError> {
             prompt,
             threads,
             quiet,
-        } => cmd_check(&directory, manifest, report.as_deref(), prompt, threads, quiet),
+        } => cmd_check(
+            &directory,
+            manifest,
+            report.as_deref(),
+            prompt,
+            threads,
+            quiet,
+        ),
         Commands::Diff { old, new, quiet } => cmd_diff(&old, &new, quiet),
     }
 }
@@ -212,13 +219,15 @@ fn cmd_compute(
             None
         };
         let pb = make_spinner(quiet);
-        let result =
-            manifest::compute_append(dir, existing.as_ref(), threads, exclude, Some(&pb));
+        let result = manifest::compute_append(dir, existing.as_ref(), threads, exclude, Some(&pb));
         pb.finish_and_clear();
         result.context("computing hashes")?
     } else {
         if !quiet {
-            eprintln!("Computing hashes for: {} (threads: {threads})", dir.display());
+            eprintln!(
+                "Computing hashes for: {} (threads: {threads})",
+                dir.display()
+            );
         }
         let pb = make_spinner(quiet);
         let result = manifest::compute_with_threads(dir, threads, Some(&pb), exclude);
@@ -229,7 +238,10 @@ fn cmd_compute(
     let count = manifest.entries.len();
     manifest.save(&out_path).context("writing manifest")?;
     if !quiet {
-        eprintln!("Manifest written to: {} ({count} files)", out_path.display());
+        eprintln!(
+            "Manifest written to: {} ({count} files)",
+            out_path.display()
+        );
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -269,9 +281,11 @@ fn cmd_check(
     } else {
         let pb = ProgressBar::new(m.entries.len() as u64);
         pb.set_style(
-            ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
-                .unwrap()
-                .progress_chars("#>-"),
+            ProgressStyle::with_template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
+            )
+            .unwrap()
+            .progress_chars("#>-"),
         );
         pb
     };
@@ -302,17 +316,16 @@ fn cmd_check(
     }
 
     if let Some(report_path) = report {
-        let html =
-            integritas::report::generate_html(dir, &summary, threads).context("generating report")?;
+        let html = integritas::report::generate_html(dir, &summary, threads)
+            .context("generating report")?;
         std::fs::write(report_path, html).context("writing report")?;
         if !quiet {
             eprintln!("Report written to: {}", report_path.display());
         }
     }
 
-    let has_differences = !summary.changed.is_empty()
-        || !summary.missing.is_empty()
-        || !summary.new.is_empty();
+    let has_differences =
+        !summary.changed.is_empty() || !summary.missing.is_empty() || !summary.new.is_empty();
 
     // Prompt to update the manifest if --prompt and there are differences.
     let mut manifest_updated = false;
@@ -320,13 +333,13 @@ fn cmd_check(
         eprint!("\nUpdate manifest to reflect current state? [y/N] ");
         let _ = std::io::stderr().flush();
         let mut input = String::new();
-        if std::io::stdin().read_line(&mut input).is_ok()
-            && input.trim().eq_ignore_ascii_case("y")
+        if std::io::stdin().read_line(&mut input).is_ok() && input.trim().eq_ignore_ascii_case("y")
         {
             let new_pb = make_spinner(quiet);
-            let updated = manifest::build_updated_manifest(dir, &summary, &m, threads, Some(&new_pb))
-                .inspect_err(|_| new_pb.finish_and_clear())
-                .context("updating manifest")?;
+            let updated =
+                manifest::build_updated_manifest(dir, &summary, &m, threads, Some(&new_pb))
+                    .inspect_err(|_| new_pb.finish_and_clear())
+                    .context("updating manifest")?;
             new_pb.finish_and_clear();
             let count = updated.entries.len();
             updated.save(&mpath).context("writing manifest")?;
@@ -342,7 +355,11 @@ fn cmd_check(
     Ok(check_exit_code(has_differences, manifest_updated))
 }
 
-fn cmd_diff(old: &std::path::Path, new: &std::path::Path, quiet: bool) -> Result<ExitCode, AppError> {
+fn cmd_diff(
+    old: &std::path::Path,
+    new: &std::path::Path,
+    quiet: bool,
+) -> Result<ExitCode, AppError> {
     let old_manifest = manifest::Manifest::load(old)
         .context(format!("reading old manifest '{}'", old.display()))?;
     let new_manifest = manifest::Manifest::load(new)
