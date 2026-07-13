@@ -88,42 +88,6 @@ pub fn build_glob_set(patterns: &[String]) -> io::Result<Option<GlobSet>> {
     Ok(Some(set))
 }
 
-/// Convert a path to a UTF-8 string, returning an error if the path contains non-UTF-8 bytes.
-fn path_to_utf8(path: &Path) -> io::Result<String> {
-    path.to_str()
-        .map(std::string::ToString::to_string)
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("non-UTF-8 path: {path:?}"),
-            )
-        })
-}
-
-/// Filter a list of absolute paths, removing those whose relative path matches any exclude glob.
-fn filter_excluded(
-    files: Vec<PathBuf>,
-    root_dir: &Path,
-    excludes: Option<&GlobSet>,
-) -> Vec<PathBuf> {
-    match excludes {
-        None => files,
-        Some(set) => files
-            .into_iter()
-            .filter(|p| {
-                // strip_prefix is infallible here: all paths come from walkdir rooted at root_dir
-                let rel = p
-                    .strip_prefix(root_dir)
-                    .expect("walkdir path must start with root_dir");
-                let rel_str = rel
-                    .to_str()
-                    .expect("non-UTF-8 path should have been rejected earlier");
-                !set.is_match(rel_str)
-            })
-            .collect(),
-    }
-}
-
 /// Result of verifying a single file.
 #[derive(Debug, PartialEq)]
 pub enum VerifyStatus {
@@ -146,6 +110,27 @@ pub struct VerifySummary {
     pub computed_hashes: HashMap<String, (String, u64)>,
 }
 
+/// Hash one file and build its manifest entry, ticking the progress bar.
+fn hash_entry(
+    abs: &Path,
+    rel: &str,
+    now: DateTime<Utc>,
+    progress: Option<&ProgressBar>,
+) -> io::Result<(String, ManifestEntry)> {
+    let (hash, size) = hash_file_with_advise(abs, true)?;
+    if let Some(pb) = progress {
+        pb.inc(1);
+    }
+    Ok((
+        rel.to_string(),
+        ManifestEntry {
+            hash: hash.to_hex().to_string(),
+            size,
+            last_verified: now,
+        },
+    ))
+}
+
 /// Append new files to an existing manifest without re-hashing known files.
 /// Files already in the manifest are kept as-is. Only files not present in the
 /// manifest are hashed and added. Files that were in the manifest but no longer
@@ -160,11 +145,6 @@ pub fn compute_append(
     let now = Utc::now();
     let threads = threads.max(1);
 
-    // Collect all current files, applying excludes
-    let all_files = io_utils::collect_sorted_by_inode(root_dir)?;
-    let glob_set = build_glob_set(excludes)?;
-    let all_files = filter_excluded(all_files, root_dir, glob_set.as_ref());
-
     // Merge excludes: keep existing manifest's excludes + new CLI excludes
     let mut final_excludes: Vec<String> = existing
         .map(|m| m.exclude_patterns.clone())
@@ -175,36 +155,29 @@ pub fn compute_append(
         }
     }
 
+    // Collect all current files, applying the merged excludes
+    let glob_set = build_glob_set(&final_excludes)?;
+    let all_files = io_utils::walk_files(root_dir, glob_set.as_ref())?;
+
     // Determine which files need hashing (not in existing manifest)
     let existing_entries = existing.map(|m| &m.entries);
     let mut manifest = Manifest::new();
     manifest.exclude_patterns = final_excludes;
 
-    let mut new_files: Vec<&PathBuf> = Vec::new();
+    let mut new_files: Vec<&io_utils::WalkedFile> = Vec::new();
 
-    for abs_path in &all_files {
-        let rel_path = path_to_utf8(
-            abs_path
-                .strip_prefix(root_dir)
-                .expect("path must be under root_dir"),
-        )?;
-
+    for f in &all_files {
         // If already in manifest, keep the existing entry
-        if let Some(entries) = existing_entries {
-            if let Some(entry) = entries.get(&rel_path) {
-                manifest.entries.insert(rel_path, entry.clone());
-                continue;
-            }
+        if let Some(entry) = existing_entries.and_then(|entries| entries.get(&f.rel)) {
+            manifest.entries.insert(f.rel.clone(), entry.clone());
+            continue;
         }
-
         // New file — needs hashing
-        new_files.push(abs_path);
+        new_files.push(f);
     }
 
-    let new_count = new_files.len();
-
     // Hash new files (parallel or sequential)
-    if threads > 1 && new_count > 1 {
+    if threads > 1 && new_files.len() > 1 {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .build()
@@ -213,25 +186,7 @@ pub fn compute_append(
         let entries: Vec<(String, ManifestEntry)> = pool.install(|| {
             new_files
                 .par_iter()
-                .map(|abs_path| {
-                    let rel_path = path_to_utf8(
-                        abs_path
-                            .strip_prefix(root_dir)
-                            .expect("path must be under root_dir"),
-                    )?;
-                    let (hash, size) = hash_file_with_advise(abs_path, true)?;
-                    if let Some(pb) = progress {
-                        pb.inc(1);
-                    }
-                    Ok((
-                        rel_path,
-                        ManifestEntry {
-                            hash: hash.to_hex().to_string(),
-                            size,
-                            last_verified: now,
-                        },
-                    ))
-                })
+                .map(|f| hash_entry(&f.abs, &f.rel, now, progress))
                 .collect::<io::Result<Vec<_>>>()
         })?;
 
@@ -239,24 +194,9 @@ pub fn compute_append(
             manifest.entries.insert(key, entry);
         }
     } else {
-        for abs_path in &new_files {
-            let rel_path = path_to_utf8(
-                abs_path
-                    .strip_prefix(root_dir)
-                    .expect("path must be under root_dir"),
-            )?;
-            let (hash, size) = hash_file_with_advise(abs_path, true)?;
-            if let Some(pb) = progress {
-                pb.inc(1);
-            }
-            manifest.entries.insert(
-                rel_path,
-                ManifestEntry {
-                    hash: hash.to_hex().to_string(),
-                    size,
-                    last_verified: now,
-                },
-            );
+        for f in new_files {
+            let (key, entry) = hash_entry(&f.abs, &f.rel, now, progress)?;
+            manifest.entries.insert(key, entry);
         }
     }
 
@@ -283,10 +223,13 @@ pub fn compute_with_threads(
     let now = Utc::now();
     let threads = threads.max(1);
 
-    // Always sort by inode (helps on HDD, no-op perf cost on SSD)
-    let files = io_utils::collect_sorted_by_inode(root_dir)?;
+    // Single walk: prunes excluded dirs and returns files in inode order
+    // (helps on HDD, no-op perf cost on SSD)
     let glob_set = build_glob_set(excludes)?;
-    let files = filter_excluded(files, root_dir, glob_set.as_ref());
+    let files = io_utils::walk_files(root_dir, glob_set.as_ref())?;
+
+    let mut m = Manifest::new();
+    m.exclude_patterns = excludes.to_vec();
 
     if threads > 1 {
         // Build a custom thread pool with the requested size
@@ -295,93 +238,23 @@ pub fn compute_with_threads(
             .build()
             .map_err(|e| io::Error::other(e.to_string()))?;
 
-        pool.install(|| {
-            let entries: Vec<(String, ManifestEntry)> = files
+        let entries: Vec<(String, ManifestEntry)> = pool.install(|| {
+            files
                 .par_iter()
-                .map(|abs_path| {
-                    let rel_path = path_to_utf8(
-                        abs_path
-                            .strip_prefix(root_dir)
-                            .expect("path must be under root_dir"),
-                    )?;
-                    let (hash, size) = hash_file_with_advise(abs_path, true)?;
-                    if let Some(pb) = progress {
-                        pb.inc(1);
-                    }
-                    Ok((
-                        rel_path,
-                        ManifestEntry {
-                            hash: hash.to_hex().to_string(),
-                            size,
-                            last_verified: now,
-                        },
-                    ))
-                })
-                .collect::<io::Result<Vec<_>>>()?;
+                .map(|f| hash_entry(&f.abs, &f.rel, now, progress))
+                .collect::<io::Result<Vec<_>>>()
+        })?;
 
-            let mut m = Manifest::new();
-            m.exclude_patterns = excludes.to_vec();
-            for (key, entry) in entries {
-                m.entries.insert(key, entry);
-            }
-            Ok(m)
-        })
+        for (key, entry) in entries {
+            m.entries.insert(key, entry);
+        }
     } else {
-        let mut m = Manifest::new();
-        m.exclude_patterns = excludes.to_vec();
-        for abs_path in &files {
-            let rel_path = path_to_utf8(
-                abs_path
-                    .strip_prefix(root_dir)
-                    .expect("path must be under root_dir"),
-            )?;
-            let (hash, size) = hash_file_with_advise(abs_path, true)?;
-            if let Some(pb) = progress {
-                pb.inc(1);
-            }
-            m.entries.insert(
-                rel_path,
-                ManifestEntry {
-                    hash: hash.to_hex().to_string(),
-                    size,
-                    last_verified: now,
-                },
-            );
+        for f in &files {
+            let (key, entry) = hash_entry(&f.abs, &f.rel, now, progress)?;
+            m.entries.insert(key, entry);
         }
-        Ok(m)
     }
-}
-
-/// Walk a directory and collect relative paths of files not in `known` and not matching `excludes`.
-fn find_new_files(
-    root_dir: &Path,
-    known: &HashMap<String, ManifestEntry>,
-    excludes: Option<&GlobSet>,
-) -> io::Result<Vec<String>> {
-    let mut new_files = Vec::new();
-    for entry in walkdir::WalkDir::new(root_dir) {
-        let entry =
-            entry.map_err(|e| io::Error::other(format!("failed to read directory entry: {e}")))?;
-        if !entry.file_type().is_file() || entry.file_name() == MANIFEST_FILENAME {
-            continue;
-        }
-        let rel_path = path_to_utf8(
-            entry
-                .path()
-                .strip_prefix(root_dir)
-                .expect("path must be under root_dir"),
-        )?;
-        if known.contains_key(&rel_path) {
-            continue;
-        }
-        if let Some(set) = excludes {
-            if set.is_match(&rel_path) {
-                continue;
-            }
-        }
-        new_files.push(rel_path);
-    }
-    Ok(new_files)
+    Ok(m)
 }
 
 /// Verify files under `root_dir` against an existing manifest.
@@ -399,103 +272,96 @@ pub fn check_with_threads(
     let threads = threads.max(1);
     let glob_set = build_glob_set(&manifest.exclude_patterns)?;
 
-    let summary = if threads > 1 {
+    // Single walk: discovers new files and yields known files in inode order
+    // (reduces seeking on rotational drives).
+    let walked = io_utils::walk_files(root_dir, glob_set.as_ref())?;
+
+    let mut to_verify: Vec<(String, PathBuf)> = Vec::new();
+    let mut new_files: Vec<String> = Vec::new();
+    for f in walked {
+        if manifest.entries.contains_key(&f.rel) {
+            to_verify.push((f.rel, f.abs));
+        } else {
+            new_files.push(f.rel);
+        }
+    }
+
+    // Manifest entries the walk didn't see are usually missing, but may just
+    // be hidden from the walk (e.g. behind an exclude pattern added after
+    // compute) — try to hash them and let NotFound decide.
+    let unseen: Vec<(String, PathBuf)> = {
+        let seen: std::collections::HashSet<&str> =
+            to_verify.iter().map(|(rel, _)| rel.as_str()).collect();
+        manifest
+            .entries
+            .keys()
+            .filter(|rel| !seen.contains(rel.as_str()))
+            .map(|rel| (rel.clone(), root_dir.join(rel)))
+            .collect()
+    };
+    to_verify.extend(unseen);
+
+    enum CheckResult {
+        Ok(String, String, u64),      // path, hash_hex, size
+        Changed(String, String, u64), // path, hash_hex, size
+        Missing(String),
+    }
+
+    let verify_one = |rel: &String, abs: &PathBuf| -> io::Result<CheckResult> {
+        let result = match hash_file_with_advise(abs, true) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => CheckResult::Missing(rel.clone()),
+            Err(e) => return Err(e),
+            Ok((hash, size)) => {
+                let hex = hash.to_hex().to_string();
+                if hex == manifest.entries[rel.as_str()].hash {
+                    CheckResult::Ok(rel.clone(), hex, size)
+                } else {
+                    CheckResult::Changed(rel.clone(), hex, size)
+                }
+            }
+        };
+        if let Some(pb) = progress {
+            pb.inc(1);
+        }
+        Ok(result)
+    };
+
+    let results: Vec<CheckResult> = if threads > 1 {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .build()
             .map_err(|e| io::Error::other(e.to_string()))?;
 
-        let entries: Vec<_> = manifest.entries.iter().collect();
-
-        enum CheckResult {
-            Ok(String, String, u64),      // path, hash_hex, size
-            Changed(String, String, u64), // path, hash_hex, size
-            Missing(String),
-        }
-
-        let results: Vec<CheckResult> = pool.install(|| {
-            entries
+        pool.install(|| {
+            to_verify
                 .par_iter()
-                .map(|(rel_path, entry)| {
-                    let abs_path = root_dir.join(rel_path);
-                    match hash_file_with_advise(&abs_path, true) {
-                        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                            if let Some(pb) = progress {
-                                pb.inc(1);
-                            }
-                            Ok(CheckResult::Missing((*rel_path).clone()))
-                        }
-                        Err(e) => Err(e),
-                        Ok((hash, size)) => {
-                            let hex = hash.to_hex().to_string();
-                            if let Some(pb) = progress {
-                                pb.inc(1);
-                            }
-                            if hex == entry.hash {
-                                Ok(CheckResult::Ok((*rel_path).clone(), hex, size))
-                            } else {
-                                Ok(CheckResult::Changed((*rel_path).clone(), hex, size))
-                            }
-                        }
-                    }
-                })
+                .map(|(rel, abs)| verify_one(rel, abs))
                 .collect::<io::Result<Vec<_>>>()
-        })?;
-
-        let mut summary = VerifySummary::default();
-        for result in results {
-            match result {
-                CheckResult::Ok(p, h, s) => {
-                    summary.computed_hashes.insert(p, (h, s));
-                    summary.ok += 1;
-                }
-                CheckResult::Changed(p, h, s) => {
-                    summary.computed_hashes.insert(p.clone(), (h, s));
-                    summary.changed.push(p);
-                }
-                CheckResult::Missing(p) => summary.missing.push(p),
-            }
-        }
-
-        // Detect new files
-        summary.new = find_new_files(root_dir, &manifest.entries, glob_set.as_ref())?;
-
-        summary
+        })?
     } else {
-        let mut summary = VerifySummary::default();
-
-        for (rel_path, entry) in &manifest.entries {
-            let abs_path = root_dir.join(rel_path);
-            match hash_file_with_advise(&abs_path, true) {
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    summary.missing.push(rel_path.clone());
-                }
-                Err(e) => return Err(e),
-                Ok((hash, size)) => {
-                    let hex = hash.to_hex().to_string();
-                    if hex == entry.hash {
-                        summary
-                            .computed_hashes
-                            .insert(rel_path.clone(), (hex, size));
-                        summary.ok += 1;
-                    } else {
-                        summary
-                            .computed_hashes
-                            .insert(rel_path.clone(), (hex, size));
-                        summary.changed.push(rel_path.clone());
-                    }
-                }
-            }
-            if let Some(pb) = progress {
-                pb.inc(1);
-            }
-        }
-
-        let new = find_new_files(root_dir, &manifest.entries, glob_set.as_ref())?;
-        summary.new = new;
-
-        summary
+        to_verify
+            .iter()
+            .map(|(rel, abs)| verify_one(rel, abs))
+            .collect::<io::Result<Vec<_>>>()?
     };
+
+    let mut summary = VerifySummary {
+        new: new_files,
+        ..VerifySummary::default()
+    };
+    for result in results {
+        match result {
+            CheckResult::Ok(p, h, s) => {
+                summary.computed_hashes.insert(p, (h, s));
+                summary.ok += 1;
+            }
+            CheckResult::Changed(p, h, s) => {
+                summary.computed_hashes.insert(p.clone(), (h, s));
+                summary.changed.push(p);
+            }
+            CheckResult::Missing(p) => summary.missing.push(p),
+        }
+    }
 
     Ok(summary)
 }
@@ -552,7 +418,11 @@ pub fn build_updated_manifest(
 
     // Hash NEW files
     if !summary.new.is_empty() {
-        let new_paths: Vec<PathBuf> = summary.new.iter().map(|p| root_dir.join(p)).collect();
+        let new_paths: Vec<(&String, PathBuf)> = summary
+            .new
+            .iter()
+            .map(|rel| (rel, root_dir.join(rel)))
+            .collect();
 
         if threads > 1 && new_paths.len() > 1 {
             let pool = rayon::ThreadPoolBuilder::new()
@@ -563,25 +433,7 @@ pub fn build_updated_manifest(
             let entries: Vec<(String, ManifestEntry)> = pool.install(|| {
                 new_paths
                     .par_iter()
-                    .map(|abs_path| {
-                        let rel_path = path_to_utf8(
-                            abs_path
-                                .strip_prefix(root_dir)
-                                .expect("path must be under root_dir"),
-                        )?;
-                        let (hash, size) = hash_file_with_advise(abs_path, true)?;
-                        if let Some(pb) = progress {
-                            pb.inc(1);
-                        }
-                        Ok((
-                            rel_path,
-                            ManifestEntry {
-                                hash: hash.to_hex().to_string(),
-                                size,
-                                last_verified: now,
-                            },
-                        ))
-                    })
+                    .map(|(rel, abs)| hash_entry(abs, rel, now, progress))
                     .collect::<io::Result<Vec<_>>>()
             })?;
 
@@ -589,24 +441,9 @@ pub fn build_updated_manifest(
                 m.entries.insert(key, entry);
             }
         } else {
-            for abs_path in &new_paths {
-                let rel_path = path_to_utf8(
-                    abs_path
-                        .strip_prefix(root_dir)
-                        .expect("path must be under root_dir"),
-                )?;
-                let (hash, size) = hash_file_with_advise(abs_path, true)?;
-                if let Some(pb) = progress {
-                    pb.inc(1);
-                }
-                m.entries.insert(
-                    rel_path,
-                    ManifestEntry {
-                        hash: hash.to_hex().to_string(),
-                        size,
-                        last_verified: now,
-                    },
-                );
+            for (rel, abs) in &new_paths {
+                let (key, entry) = hash_entry(abs, rel, now, progress)?;
+                m.entries.insert(key, entry);
             }
         }
     }

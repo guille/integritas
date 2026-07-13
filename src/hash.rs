@@ -7,9 +7,8 @@ use crate::io_utils;
 /// Size of the read buffer (256 KiB).
 const BUF_SIZE: usize = 256 * 1024;
 
-/// Threshold above which we use `update_rayon` for parallel hashing (64 MiB).
-/// Below this, rayon overhead exceeds the benefit. Above this, multi-core
-/// BLAKE3 compression provides ~8-10% throughput improvement when data is cached.
+/// Threshold above which we memory-map the file and hash with `update_rayon`
+/// (64 MiB). Below this, mmap/rayon overhead exceeds the benefit.
 const RAYON_THRESHOLD: u64 = 64 * 1024 * 1024;
 
 /// Hash a file using BLAKE3 with a 256 KiB read buffer.
@@ -33,6 +32,8 @@ pub fn hash_file_with_advise(path: &Path, use_fadvise: bool) -> io::Result<(blak
 
     let hash = if size >= RAYON_THRESHOLD {
         hash_large_file(&mut file)?
+    } else if size < BUF_SIZE as u64 {
+        hash_tiny_file(&mut file, size)?
     } else {
         hash_small_file(&mut file)?
     };
@@ -42,6 +43,16 @@ pub fn hash_file_with_advise(path: &Path, use_fadvise: bool) -> io::Result<(blak
     }
 
     Ok((hash, size))
+}
+
+/// Hash a file smaller than the read buffer by reading it whole.
+/// Avoids zeroing a 256 KiB buffer for files much smaller than that.
+fn hash_tiny_file(file: &mut File, size: u64) -> io::Result<blake3::Hash> {
+    // One spare byte lets read_to_end hit EOF without growing the buffer.
+    #[allow(clippy::cast_possible_truncation)] // size < BUF_SIZE
+    let mut data = Vec::with_capacity(size as usize + 1);
+    file.read_to_end(&mut data)?;
+    Ok(blake3::hash(&data))
 }
 
 /// Hash a small file sequentially.
@@ -60,9 +71,26 @@ fn hash_small_file(file: &mut File) -> io::Result<blake3::Hash> {
     Ok(hasher.finalize())
 }
 
-/// Hash a large file using BLAKE3's rayon-based parallel hashing.
-/// Uses chunked streaming to avoid loading multi-GB files entirely into RAM.
+/// Hash a large file by memory-mapping it and hashing with BLAKE3's
+/// rayon-based parallelism across the whole file — no read syscalls or
+/// buffer copies, and page faults overlap with hashing.
+/// Falls back to chunked streaming if the file cannot be mapped.
 fn hash_large_file(file: &mut File) -> io::Result<blake3::Hash> {
+    // SAFETY: mapping a file another process truncates concurrently can
+    // fault. Like b3sum, we accept this in exchange for the throughput.
+    match unsafe { memmap2::Mmap::map(&*file) } {
+        Ok(map) => {
+            let _ = map.advise(memmap2::Advice::Sequential);
+            let mut hasher = blake3::Hasher::new();
+            hasher.update_rayon(&map);
+            Ok(hasher.finalize())
+        }
+        Err(_) => hash_large_file_streaming(file),
+    }
+}
+
+/// Streaming fallback for large files on filesystems where mmap fails.
+fn hash_large_file_streaming(file: &mut File) -> io::Result<blake3::Hash> {
     let mut hasher = blake3::Hasher::new();
     // Use 4 MiB chunks for rayon — large enough to benefit from parallel BLAKE3 compression
     const RAYON_CHUNK: usize = 4 * 1024 * 1024;
@@ -144,7 +172,8 @@ mod tests {
 
     #[test]
     fn test_hash_large_file_rayon() {
-        // Create a file > RAYON_THRESHOLD (1 MiB)
+        // Exercise the mmap + rayon path directly — a 2 MB file would
+        // normally take the streaming path (threshold is 64 MiB).
         let data: Vec<u8> = (0..2_000_000u64)
             .map(|i| u8::try_from(i % 256).unwrap())
             .collect();
@@ -154,9 +183,13 @@ mod tests {
         tmp.write_all(&data).unwrap();
         tmp.flush().unwrap();
 
-        let (got, size) = hash_file(tmp.path()).unwrap();
+        let mut file = File::open(tmp.path()).unwrap();
+        let got = hash_large_file(&mut file).unwrap();
         assert_eq!(got, expected);
-        assert_eq!(size, data.len() as u64);
+
+        let mut file = File::open(tmp.path()).unwrap();
+        let got_streaming = hash_large_file_streaming(&mut file).unwrap();
+        assert_eq!(got_streaming, expected);
     }
 
     #[test]

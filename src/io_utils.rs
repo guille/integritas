@@ -1,9 +1,10 @@
 //! I/O performance utilities: fadvise, inode sorting.
 
+use globset::GlobSet;
 use std::fs;
-use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use walkdir::DirEntryExt;
 
 /// Hint to the kernel that we'll read this file sequentially.
 /// Call before reading.
@@ -21,35 +22,67 @@ pub fn advise_dontneed(file: &fs::File) {
     }
 }
 
-/// Collect all file paths under `root` and sort by inode number.
-/// This reduces disk seeking on rotational drives.
-pub fn collect_sorted_by_inode(root: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
-    let mut entries: Vec<(std::path::PathBuf, u64)> = Vec::new();
+/// A file discovered during a directory walk.
+#[derive(Debug)]
+pub struct WalkedFile {
+    /// Absolute path (rooted at the walk root).
+    pub abs: PathBuf,
+    /// Path relative to the walk root, as UTF-8 (manifest key).
+    pub rel: String,
+    /// Inode number, taken from the dirent (no extra stat).
+    pub ino: u64,
+}
 
-    for entry in walkdir::WalkDir::new(root).into_iter().filter(|e| {
-        e.as_ref().map_or(true, |e| {
-            e.file_type().is_file() && e.file_name() != crate::manifest::MANIFEST_FILENAME
-        }) // keep errors so we can propagate them
-    }) {
+/// Walk all files under `root`, skipping the manifest file and anything
+/// matching `excludes` (directories matching a pattern are pruned entirely,
+/// so their subtrees are never visited). Results are sorted by inode number,
+/// which reduces disk seeking on rotational drives.
+pub fn walk_files(root: &Path, excludes: Option<&GlobSet>) -> std::io::Result<Vec<WalkedFile>> {
+    let mut files: Vec<WalkedFile> = Vec::new();
+
+    let walker = walkdir::WalkDir::new(root).into_iter().filter_entry(|e| {
+        // Prune excluded directories so their subtrees are never walked.
+        if e.depth() == 0 || !e.file_type().is_dir() {
+            return true;
+        }
+        match (
+            excludes,
+            e.path().strip_prefix(root).ok().and_then(Path::to_str),
+        ) {
+            (Some(set), Some(rel)) => !set.is_match(rel),
+            _ => true,
+        }
+    });
+
+    for entry in walker {
         let entry = entry
             .map_err(|e| std::io::Error::other(format!("failed to read directory entry: {e}")))?;
-        if !entry.file_type().is_file() {
+        if !entry.file_type().is_file() || entry.file_name() == crate::manifest::MANIFEST_FILENAME {
             continue;
         }
+        let rel_path = entry
+            .path()
+            .strip_prefix(root)
+            .expect("walkdir path must start with root");
         // Reject non-UTF-8 paths early — our manifest format requires UTF-8
-        let path = entry.path();
-        if path.to_str().is_none() {
+        let Some(rel) = rel_path.to_str() else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("non-UTF-8 path: {path:?}"),
+                format!("non-UTF-8 path: {:?}", entry.path()),
             ));
+        };
+        if excludes.is_some_and(|set| set.is_match(rel)) {
+            continue;
         }
-        let metadata = entry.metadata()?;
-        entries.push((entry.into_path(), metadata.ino()));
+        files.push(WalkedFile {
+            rel: rel.to_string(),
+            ino: entry.ino(),
+            abs: entry.into_path(),
+        });
     }
 
-    entries.sort_by_key(|e| e.1);
-    Ok(entries.into_iter().map(|e| e.0).collect())
+    files.sort_unstable_by_key(|f| f.ino);
+    Ok(files)
 }
 
 #[cfg(test)]
@@ -58,12 +91,30 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn test_collect_sorted_by_inode() {
+    fn test_walk_files_sorted_by_inode() {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("a.txt"), b"a").unwrap();
         fs::write(dir.path().join("b.txt"), b"b").unwrap();
-        let files = collect_sorted_by_inode(dir.path()).unwrap();
+        let files = walk_files(dir.path(), None).unwrap();
         assert_eq!(files.len(), 2);
+        assert!(files.windows(2).all(|w| w[0].ino <= w[1].ino));
+        assert!(files.iter().all(|f| f.abs.is_absolute() || f.abs.exists()));
+    }
+
+    #[test]
+    fn test_walk_files_prunes_excluded_dirs() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("keep.txt"), b"keep").unwrap();
+        fs::create_dir(dir.path().join("cache")).unwrap();
+        fs::write(dir.path().join("cache/blob.bin"), b"skip").unwrap();
+        fs::write(dir.path().join("skip.tmp"), b"skip").unwrap();
+
+        let set = crate::manifest::build_glob_set(&["cache".to_string(), "*.tmp".to_string()])
+            .unwrap()
+            .unwrap();
+        let files = walk_files(dir.path(), Some(&set)).unwrap();
+        let rels: Vec<&str> = files.iter().map(|f| f.rel.as_str()).collect();
+        assert_eq!(rels, vec!["keep.txt"]);
     }
 
     #[test]
@@ -77,7 +128,7 @@ mod tests {
         let invalid_path = dir.path().join(invalid_name);
         fs::write(&invalid_path, b"data").unwrap();
 
-        let result = collect_sorted_by_inode(dir.path());
+        let result = walk_files(dir.path(), None);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
