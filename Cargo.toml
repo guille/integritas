@@ -38,5 +38,6 @@ too_many_lines               = "allow"
 unnecessary_debug_formatting = "allow"
 
 [profile.release]
-lto           = "thin"
+strip         = true
+lto           = true
 codegen-units = 1
