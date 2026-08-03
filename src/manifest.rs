@@ -726,6 +726,144 @@ mod tests {
     }
 
     #[test]
+    fn test_check_verifies_entries_hidden_by_late_exclude() {
+        let dir = create_test_dir();
+        let mut manifest = compute(dir.path()).unwrap();
+
+        // An exclude added after compute hides file1.txt from the walk, but
+        // the file still exists on disk — it must verify OK, not MISSING.
+        manifest.exclude_patterns.push("file1.txt".to_string());
+        let summary = check(dir.path(), &manifest).unwrap();
+        assert_eq!(summary.ok, 3);
+        assert!(summary.missing.is_empty());
+
+        // A hidden entry that actually changed is still caught.
+        fs::write(dir.path().join("file1.txt"), b"modified").unwrap();
+        let summary = check(dir.path(), &manifest).unwrap();
+        assert_eq!(summary.changed, vec!["file1.txt"]);
+
+        // And a hidden entry that is truly gone is reported missing.
+        fs::remove_file(dir.path().join("file1.txt")).unwrap();
+        let summary = check(dir.path(), &manifest).unwrap();
+        assert_eq!(summary.missing, vec!["file1.txt"]);
+    }
+
+    #[test]
+    fn test_check_parallel_matches_sequential() {
+        let dir = create_test_dir();
+        for i in 0..20 {
+            fs::write(
+                dir.path().join(format!("par_{i}.txt")),
+                format!("data {i}").as_bytes(),
+            )
+            .unwrap();
+        }
+        let manifest = compute(dir.path()).unwrap();
+
+        fs::write(dir.path().join("par_0.txt"), b"changed").unwrap();
+        fs::write(dir.path().join("par_1.txt"), b"also changed").unwrap();
+        fs::remove_file(dir.path().join("par_2.txt")).unwrap();
+        fs::write(dir.path().join("brand_new.txt"), b"new").unwrap();
+
+        let sorted = |mut v: Vec<String>| {
+            v.sort();
+            v
+        };
+        let seq = check_with_threads(dir.path(), &manifest, 1, None).unwrap();
+        let par = check_with_threads(dir.path(), &manifest, 4, None).unwrap();
+
+        assert_eq!(sorted(par.changed), vec!["par_0.txt", "par_1.txt"]);
+        assert_eq!(par.missing, vec!["par_2.txt"]);
+        assert_eq!(par.new, vec!["brand_new.txt"]);
+        assert_eq!(seq.ok, par.ok);
+        assert_eq!(seq.computed_hashes, par.computed_hashes);
+    }
+
+    #[test]
+    fn test_build_updated_manifest_parallel_matches_sequential() {
+        let dir = create_test_dir();
+        let manifest = compute(dir.path()).unwrap();
+        // Several new files to exercise the parallel hashing branch
+        for i in 0..10 {
+            fs::write(
+                dir.path().join(format!("new_{i}.txt")),
+                format!("new {i}").as_bytes(),
+            )
+            .unwrap();
+        }
+        let summary = check(dir.path(), &manifest).unwrap();
+        assert_eq!(summary.new.len(), 10);
+
+        let seq = build_updated_manifest(dir.path(), &summary, &manifest, 1, None).unwrap();
+        let par = build_updated_manifest(dir.path(), &summary, &manifest, 4, None).unwrap();
+
+        assert_eq!(seq.entries.len(), 13);
+        assert_eq!(seq.entries.len(), par.entries.len());
+        for (path, entry) in &seq.entries {
+            let par_entry = par.entries.get(path).expect("missing in parallel result");
+            assert_eq!(entry.hash, par_entry.hash, "hash mismatch for {path}");
+            assert_eq!(entry.size, par_entry.size);
+        }
+    }
+
+    #[test]
+    fn test_load_rejects_invalid_json() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bad.json");
+        fs::write(&path, b"not json {").unwrap();
+        let err = Manifest::load(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_load_rejects_unsupported_version() {
+        let dir = create_test_dir();
+        let mut manifest = compute(dir.path()).unwrap();
+        manifest.version = MANIFEST_VERSION + 1;
+        let path = dir.path().join("future.json");
+        manifest.save(&path).unwrap();
+
+        let err = Manifest::load(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("unsupported manifest version"));
+    }
+
+    #[test]
+    fn test_check_errors_on_unreadable_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = create_test_dir();
+        let manifest = compute(dir.path()).unwrap();
+        let target = dir.path().join("file1.txt");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::File::open(&target).is_ok() {
+            return; // running as root — permissions are not enforced
+        }
+
+        let err = check(dir.path(), &manifest).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn test_compute_append_merges_excludes() {
+        let dir = create_test_dir();
+        let manifest = compute_with_threads(dir.path(), 1, None, &["*.tmp".to_string()]).unwrap();
+
+        fs::write(dir.path().join("cache.tmp"), b"temp").unwrap();
+        fs::write(dir.path().join("notes.log"), b"log").unwrap();
+        fs::write(dir.path().join("file4.txt"), b"real").unwrap();
+
+        // CLI adds *.log and repeats *.tmp; both apply, without duplicates.
+        let cli_excludes = vec!["*.log".to_string(), "*.tmp".to_string()];
+        let updated = compute_append(dir.path(), Some(&manifest), 1, &cli_excludes, None).unwrap();
+
+        assert!(!updated.entries.contains_key("cache.tmp"));
+        assert!(!updated.entries.contains_key("notes.log"));
+        assert!(updated.entries.contains_key("file4.txt"));
+        assert_eq!(updated.exclude_patterns, vec!["*.tmp", "*.log"]);
+    }
+
+    #[test]
     fn test_build_updated_manifest() {
         let dir = create_test_dir();
         let manifest = compute(dir.path()).unwrap();
