@@ -17,6 +17,8 @@ Examples:
   integritas compute /mnt/backup          Create a manifest
   integritas check /mnt/backup            Verify files against manifest
   integritas check /mnt/backup --prompt   Verify and offer to update manifest
+  integritas check /mnt/backup --accept-new
+                                          Verify, auto-adding new files to manifest
   integritas diff old.json new.json       Compare two manifests
 
 Exit codes:
@@ -79,6 +81,11 @@ enum Commands {
         /// Changed files use already-computed hashes; new files are hashed; missing files are removed.
         #[arg(short = 'p', long)]
         prompt: bool,
+
+        /// If new files are the only difference, add them to the manifest and
+        /// exit successfully. Any other difference fails (or prompts) as usual.
+        #[arg(long)]
+        accept_new: bool,
 
         /// Number of threads for parallel file hashing.
         /// Defaults to CPU count. Use -j1 for HDDs.
@@ -158,6 +165,7 @@ fn run(command: Commands) -> Result<ExitCode, AppError> {
             manifest,
             report,
             prompt,
+            accept_new,
             threads,
             quiet,
         } => cmd_check(
@@ -165,6 +173,7 @@ fn run(command: Commands) -> Result<ExitCode, AppError> {
             manifest,
             report.as_deref(),
             prompt,
+            accept_new,
             threads,
             quiet,
         ),
@@ -251,6 +260,7 @@ fn cmd_check(
     manifest_path_arg: Option<PathBuf>,
     report: Option<&std::path::Path>,
     prompt: bool,
+    accept_new: bool,
     threads: usize,
     quiet: bool,
 ) -> Result<ExitCode, AppError> {
@@ -327,32 +337,56 @@ fn cmd_check(
     let has_differences =
         !summary.changed.is_empty() || !summary.missing.is_empty() || !summary.new.is_empty();
 
-    // Prompt to update the manifest if --prompt and there are differences.
     let mut manifest_updated = false;
-    if prompt && has_differences {
+    if accept_new && only_new_differences(&summary) {
+        // New files are the only difference: add them without asking.
+        save_updated_manifest(dir, &summary, &m, &mpath, threads, quiet)?;
+        manifest_updated = true;
+    } else if prompt && has_differences {
         eprint!("\nUpdate manifest to reflect current state? [y/N] ");
         let _ = std::io::stderr().flush();
         let mut input = String::new();
         if std::io::stdin().read_line(&mut input).is_ok() && input.trim().eq_ignore_ascii_case("y")
         {
-            let new_pb = make_spinner(quiet);
-            let updated =
-                manifest::build_updated_manifest(dir, &summary, &m, threads, Some(&new_pb))
-                    .inspect_err(|_| new_pb.finish_and_clear())
-                    .context("updating manifest")?;
-            new_pb.finish_and_clear();
-            let count = updated.entries.len();
-            updated.save(&mpath).context("writing manifest")?;
-            if !quiet {
-                eprintln!("Manifest updated: {} ({count} files)", mpath.display());
-            }
+            save_updated_manifest(dir, &summary, &m, &mpath, threads, quiet)?;
             manifest_updated = true;
         } else if !quiet {
             eprintln!("Manifest not updated.");
         }
+    } else if accept_new && has_differences && !quiet {
+        eprintln!("--accept-new: manifest not updated (differences beyond new files).");
     }
 
     Ok(check_exit_code(has_differences, manifest_updated))
+}
+
+/// True when new files are the only kind of difference found.
+fn only_new_differences(summary: &manifest::VerifySummary) -> bool {
+    !summary.new.is_empty() && summary.changed.is_empty() && summary.missing.is_empty()
+}
+
+/// Rebuild the manifest from check results and save it over `mpath`.
+/// Changed files reuse already-computed hashes; new files are hashed;
+/// missing files are dropped.
+fn save_updated_manifest(
+    dir: &std::path::Path,
+    summary: &manifest::VerifySummary,
+    old: &manifest::Manifest,
+    mpath: &std::path::Path,
+    threads: usize,
+    quiet: bool,
+) -> Result<(), AppError> {
+    let pb = make_spinner(quiet);
+    let updated = manifest::build_updated_manifest(dir, summary, old, threads, Some(&pb))
+        .inspect_err(|_| pb.finish_and_clear())
+        .context("updating manifest")?;
+    pb.finish_and_clear();
+    let count = updated.entries.len();
+    updated.save(mpath).context("writing manifest")?;
+    if !quiet {
+        eprintln!("Manifest updated: {} ({count} files)", mpath.display());
+    }
+    Ok(())
 }
 
 fn cmd_diff(
@@ -432,5 +466,28 @@ mod tests {
     fn differences_with_successful_update_succeed() {
         // Regression: --prompt accepted and manifest saved must exit 0.
         assert_eq!(code(check_exit_code(true, true)), code(ExitCode::SUCCESS));
+    }
+
+    fn summary(changed: &[&str], missing: &[&str], new: &[&str]) -> manifest::VerifySummary {
+        let to_vec = |xs: &[&str]| xs.iter().map(ToString::to_string).collect();
+        manifest::VerifySummary {
+            changed: to_vec(changed),
+            missing: to_vec(missing),
+            new: to_vec(new),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn only_new_requires_new_files() {
+        assert!(!only_new_differences(&summary(&[], &[], &[])));
+        assert!(only_new_differences(&summary(&[], &[], &["a"])));
+    }
+
+    #[test]
+    fn only_new_rejects_other_differences() {
+        assert!(!only_new_differences(&summary(&["c"], &[], &["a"])));
+        assert!(!only_new_differences(&summary(&[], &["m"], &["a"])));
+        assert!(!only_new_differences(&summary(&["c"], &["m"], &[])));
     }
 }

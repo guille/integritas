@@ -40,6 +40,7 @@ Options:
 - `-m <path>` — use a specific manifest file
 - `-r <path>` — write an HTML report
 - `-p` / `--prompt` — after showing results, offer to update the manifest in-place (avoids a full re-compute)
+- `--accept-new` — if new files are the only difference, add them to the manifest and exit 0; any other difference fails (or prompts) as usual
 
 ### Compare two manifests
 
@@ -105,6 +106,8 @@ If accepted:
 - Missing files: removes them from the manifest
 
 This avoids running a full `compute` just to accept known changes.
+
+When combined with `--accept-new`: if new files are the *only* difference no prompt is displayed and the manifest is updated, any other case else still asks.
 
 ## Requirements
 
