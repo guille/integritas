@@ -22,6 +22,9 @@ pub struct ManifestEntry {
     pub last_verified: DateTime<Utc>,
 }
 
+/// The manifest format version this build reads and writes.
+pub const MANIFEST_VERSION: u32 = 1;
+
 /// The full manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
@@ -43,16 +46,28 @@ impl Default for Manifest {
 impl Manifest {
     pub fn new() -> Self {
         Self {
-            version: 1,
+            version: MANIFEST_VERSION,
             exclude_patterns: Vec::new(),
             entries: HashMap::new(),
         }
     }
 
     /// Load a manifest from a JSON file.
+    /// Fails with `InvalidData` on malformed JSON or an unsupported version.
     pub fn load(path: &Path) -> io::Result<Self> {
         let content = fs::read_to_string(path)?;
-        serde_json::from_str(&content).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        let manifest: Self = serde_json::from_str(&content)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if manifest.version != MANIFEST_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported manifest version {} (this build supports version {MANIFEST_VERSION})",
+                    manifest.version
+                ),
+            ));
+        }
+        Ok(manifest)
     }
 
     /// Save the manifest to a JSON file atomically (write to tmp, then rename).

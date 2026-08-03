@@ -85,7 +85,7 @@ The manifest is a JSON file (`.integritas-manifest.json`) with this structure:
 ```
 
 Fields:
-- `version` — manifest format version (currently 1)
+- `version` — manifest format version (currently 1); manifests with any other version are rejected
 - `exclude_patterns` — globs used during compute, also applied during check
 - `entries` — map of relative paths to their hash, file size, and last verification timestamp
 - `hash` — hex-encoded BLAKE3 digest
