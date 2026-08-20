@@ -146,6 +146,34 @@ fn hash_entry(
     ))
 }
 
+/// Hash a batch of files into manifest entries.
+/// Runs in a dedicated rayon pool when there is more than one file to hash.
+fn hash_all(
+    files: &[(&Path, &str)],
+    threads: usize,
+    now: DateTime<Utc>,
+    progress: Option<&ProgressBar>,
+) -> io::Result<Vec<(String, ManifestEntry)>> {
+    if threads > 1 && files.len() > 1 {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+
+        pool.install(|| {
+            files
+                .par_iter()
+                .map(|(abs, rel)| hash_entry(abs, rel, now, progress))
+                .collect()
+        })
+    } else {
+        files
+            .iter()
+            .map(|(abs, rel)| hash_entry(abs, rel, now, progress))
+            .collect()
+    }
+}
+
 /// Append new files to an existing manifest without re-hashing known files.
 /// Files already in the manifest are kept as-is. Only files not present in the
 /// manifest are hashed and added. Files that were in the manifest but no longer
@@ -191,28 +219,12 @@ pub fn compute_append(
         new_files.push(f);
     }
 
-    // Hash new files (parallel or sequential)
-    if threads > 1 && new_files.len() > 1 {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .map_err(|e| io::Error::other(e.to_string()))?;
-
-        let entries: Vec<(String, ManifestEntry)> = pool.install(|| {
-            new_files
-                .par_iter()
-                .map(|f| hash_entry(&f.abs, &f.rel, now, progress))
-                .collect::<io::Result<Vec<_>>>()
-        })?;
-
-        for (key, entry) in entries {
-            manifest.entries.insert(key, entry);
-        }
-    } else {
-        for f in new_files {
-            let (key, entry) = hash_entry(&f.abs, &f.rel, now, progress)?;
-            manifest.entries.insert(key, entry);
-        }
+    let to_hash: Vec<(&Path, &str)> = new_files
+        .iter()
+        .map(|f| (f.abs.as_path(), f.rel.as_str()))
+        .collect();
+    for (key, entry) in hash_all(&to_hash, threads, now, progress)? {
+        manifest.entries.insert(key, entry);
     }
 
     Ok(manifest)
@@ -246,28 +258,12 @@ pub fn compute_with_threads(
     let mut m = Manifest::new();
     m.exclude_patterns = excludes.to_vec();
 
-    if threads > 1 {
-        // Build a custom thread pool with the requested size
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .map_err(|e| io::Error::other(e.to_string()))?;
-
-        let entries: Vec<(String, ManifestEntry)> = pool.install(|| {
-            files
-                .par_iter()
-                .map(|f| hash_entry(&f.abs, &f.rel, now, progress))
-                .collect::<io::Result<Vec<_>>>()
-        })?;
-
-        for (key, entry) in entries {
-            m.entries.insert(key, entry);
-        }
-    } else {
-        for f in &files {
-            let (key, entry) = hash_entry(&f.abs, &f.rel, now, progress)?;
-            m.entries.insert(key, entry);
-        }
+    let to_hash: Vec<(&Path, &str)> = files
+        .iter()
+        .map(|f| (f.abs.as_path(), f.rel.as_str()))
+        .collect();
+    for (key, entry) in hash_all(&to_hash, threads, now, progress)? {
+        m.entries.insert(key, entry);
     }
     Ok(m)
 }
@@ -303,7 +299,8 @@ pub fn check_with_threads(
 
     // Manifest entries the walk didn't see are usually missing, but may just
     // be hidden from the walk (e.g. behind an exclude pattern added after
-    // compute) — try to hash them and let NotFound decide.
+    // compute) — try to hash them and let NotFound decide. These have no
+    // dirent to read an inode from, so they're appended out of inode order.
     let unseen: Vec<(String, PathBuf)> = {
         let seen: std::collections::HashSet<&str> =
             to_verify.iter().map(|(rel, _)| rel.as_str()).collect();
@@ -432,35 +429,14 @@ pub fn build_updated_manifest(
     }
 
     // Hash NEW files
-    if !summary.new.is_empty() {
-        let new_paths: Vec<(&String, PathBuf)> = summary
-            .new
-            .iter()
-            .map(|rel| (rel, root_dir.join(rel)))
-            .collect();
-
-        if threads > 1 && new_paths.len() > 1 {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .build()
-                .map_err(|e| io::Error::other(e.to_string()))?;
-
-            let entries: Vec<(String, ManifestEntry)> = pool.install(|| {
-                new_paths
-                    .par_iter()
-                    .map(|(rel, abs)| hash_entry(abs, rel, now, progress))
-                    .collect::<io::Result<Vec<_>>>()
-            })?;
-
-            for (key, entry) in entries {
-                m.entries.insert(key, entry);
-            }
-        } else {
-            for (rel, abs) in &new_paths {
-                let (key, entry) = hash_entry(abs, rel, now, progress)?;
-                m.entries.insert(key, entry);
-            }
-        }
+    let new_paths: Vec<PathBuf> = summary.new.iter().map(|rel| root_dir.join(rel)).collect();
+    let to_hash: Vec<(&Path, &str)> = new_paths
+        .iter()
+        .zip(&summary.new)
+        .map(|(abs, rel)| (abs.as_path(), rel.as_str()))
+        .collect();
+    for (key, entry) in hash_all(&to_hash, threads, now, progress)? {
+        m.entries.insert(key, entry);
     }
 
     Ok(m)

@@ -1,7 +1,6 @@
 //! HTML report generation for integrity check results.
 
 use std::fmt::Write;
-use std::io;
 use std::path::Path;
 
 use chrono::Utc;
@@ -9,11 +8,7 @@ use chrono::Utc;
 use crate::manifest::VerifySummary;
 
 /// Generate a self-contained HTML report from a verification summary.
-pub fn generate_html(
-    directory: &Path,
-    summary: &VerifySummary,
-    threads: usize,
-) -> io::Result<String> {
+pub fn generate_html(directory: &Path, summary: &VerifySummary, threads: usize) -> String {
     let now = Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
     let total =
         summary.ok as usize + summary.changed.len() + summary.missing.len() + summary.new.len();
@@ -101,7 +96,7 @@ pub fn generate_html(
     }
 
     html.push_str("</div>\n</body>\n</html>\n");
-    Ok(html)
+    html
 }
 
 fn write_section(html: &mut String, title: &str, color: &str, files: &[String]) {
@@ -145,7 +140,7 @@ mod tests {
             new: vec![],
             ..Default::default()
         };
-        let html = generate_html(&PathBuf::from("/tmp/test"), &summary, 8).unwrap();
+        let html = generate_html(&PathBuf::from("/tmp/test"), &summary, 8);
         assert!(html.contains("PASS"));
         assert!(html.contains("/tmp/test"));
         assert!(html.contains(">10<"));
@@ -160,7 +155,7 @@ mod tests {
             new: vec!["new.txt".to_string()],
             ..Default::default()
         };
-        let html = generate_html(&PathBuf::from("/data"), &summary, 4).unwrap();
+        let html = generate_html(&PathBuf::from("/data"), &summary, 4);
         assert!(html.contains("FAIL"));
         assert!(html.contains("file1.txt"));
         assert!(html.contains("gone.txt"));
@@ -177,7 +172,7 @@ mod tests {
             new: vec![],
             ..Default::default()
         };
-        let html = generate_html(&PathBuf::from("/tmp"), &summary, 1).unwrap();
+        let html = generate_html(&PathBuf::from("/tmp"), &summary, 1);
         assert!(!html.contains("<script>"));
         assert!(html.contains("&lt;script&gt;"));
     }

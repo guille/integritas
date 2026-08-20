@@ -3,6 +3,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use integritas::manifest;
 use std::fmt::Display;
 use std::io::Write;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -29,8 +30,8 @@ struct Cli {
     command: Commands,
 }
 
-fn num_threads_default() -> usize {
-    std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+fn num_threads_default() -> NonZeroUsize {
+    std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN)
 }
 
 #[derive(Subcommand)]
@@ -57,7 +58,7 @@ enum Commands {
         /// Number of threads for parallel file hashing.
         /// Defaults to CPU count. Use -j1 for HDDs.
         #[arg(short = 'j', long, default_value_t = num_threads_default())]
-        threads: usize,
+        threads: NonZeroUsize,
 
         /// Suppress progress bars and informational messages.
         #[arg(short, long)]
@@ -90,7 +91,7 @@ enum Commands {
         /// Number of threads for parallel file hashing.
         /// Defaults to CPU count. Use -j1 for HDDs.
         #[arg(short = 'j', long, default_value_t = num_threads_default())]
-        threads: usize,
+        threads: NonZeroUsize,
 
         /// Suppress progress bars and informational messages.
         #[arg(short, long)]
@@ -126,16 +127,22 @@ impl Display for AppError {
 impl std::error::Error for AppError {}
 
 /// Attach a user-facing context message to any `Result` whose error is `Display`.
-///
-/// The context string is only formatted on the error path, so passing a `&str`
-/// literal here is free on success.
 trait Context<T> {
+    /// Use for `&str` literals, which cost nothing on the success path.
     fn context(self, ctx: impl Display) -> Result<T, AppError>;
+
+    /// Use when the message needs formatting, so the cost lands only on the
+    /// error path.
+    fn with_context<D: Display>(self, ctx: impl FnOnce() -> D) -> Result<T, AppError>;
 }
 
 impl<T, E: Display> Context<T> for Result<T, E> {
     fn context(self, ctx: impl Display) -> Result<T, AppError> {
         self.map_err(|e| AppError(format!("{ctx}: {e}")))
+    }
+
+    fn with_context<D: Display>(self, ctx: impl FnOnce() -> D) -> Result<T, AppError> {
+        self.map_err(|e| AppError(format!("{}: {e}", ctx())))
     }
 }
 
@@ -159,7 +166,7 @@ fn run(command: Commands) -> Result<ExitCode, AppError> {
             exclude,
             threads,
             quiet,
-        } => cmd_compute(&directory, output, append, &exclude, threads, quiet),
+        } => cmd_compute(&directory, output, append, &exclude, threads.get(), quiet),
         Commands::Check {
             directory,
             manifest,
@@ -174,7 +181,7 @@ fn run(command: Commands) -> Result<ExitCode, AppError> {
             report.as_deref(),
             prompt,
             accept_new,
-            threads,
+            threads.get(),
             quiet,
         ),
         Commands::Diff { old, new, quiet } => cmd_diff(&old, &new, quiet),
@@ -211,7 +218,8 @@ fn cmd_compute(
 
     let manifest = if append {
         let existing = if out_path.exists() {
-            let m = manifest::Manifest::load(&out_path).context("reading existing manifest")?;
+            let m = manifest::Manifest::load(&out_path)
+                .with_context(|| format!("reading existing manifest '{}'", out_path.display()))?;
             if !quiet {
                 eprintln!(
                     "Appending to existing manifest ({} entries, threads: {threads})",
@@ -245,7 +253,9 @@ fn cmd_compute(
     };
 
     let count = manifest.entries.len();
-    manifest.save(&out_path).context("writing manifest")?;
+    manifest
+        .save(&out_path)
+        .with_context(|| format!("writing manifest '{}'", out_path.display()))?;
     if !quiet {
         eprintln!(
             "Manifest written to: {} ({count} files)",
@@ -276,7 +286,8 @@ fn cmd_check(
         )));
     }
 
-    let m = manifest::Manifest::load(&mpath).context("reading manifest")?;
+    let m = manifest::Manifest::load(&mpath)
+        .with_context(|| format!("reading manifest '{}'", mpath.display()))?;
 
     if !quiet {
         eprintln!(
@@ -326,9 +337,9 @@ fn cmd_check(
     }
 
     if let Some(report_path) = report {
-        let html = integritas::report::generate_html(dir, &summary, threads)
-            .context("generating report")?;
-        std::fs::write(report_path, html).context("writing report")?;
+        let html = integritas::report::generate_html(dir, &summary, threads);
+        std::fs::write(report_path, html)
+            .with_context(|| format!("writing report '{}'", report_path.display()))?;
         if !quiet {
             eprintln!("Report written to: {}", report_path.display());
         }
@@ -382,7 +393,9 @@ fn save_updated_manifest(
         .context("updating manifest")?;
     pb.finish_and_clear();
     let count = updated.entries.len();
-    updated.save(mpath).context("writing manifest")?;
+    updated
+        .save(mpath)
+        .with_context(|| format!("writing manifest '{}'", mpath.display()))?;
     if !quiet {
         eprintln!("Manifest updated: {} ({count} files)", mpath.display());
     }
@@ -395,9 +408,9 @@ fn cmd_diff(
     quiet: bool,
 ) -> Result<ExitCode, AppError> {
     let old_manifest = manifest::Manifest::load(old)
-        .context(format!("reading old manifest '{}'", old.display()))?;
+        .with_context(|| format!("reading old manifest '{}'", old.display()))?;
     let new_manifest = manifest::Manifest::load(new)
-        .context(format!("reading new manifest '{}'", new.display()))?;
+        .with_context(|| format!("reading new manifest '{}'", new.display()))?;
 
     let summary = manifest::diff(&old_manifest, &new_manifest);
 
