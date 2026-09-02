@@ -165,9 +165,8 @@ pub struct VerifySummary {
     pub changed: Vec<String>,
     pub missing: Vec<String>,
     pub new: Vec<String>,
-    /// Computed hashes from the check run (path -> (`hash_hex`, size)).
-    /// Contains entries for both OK and CHANGED files.
-    /// Used by --prompt to rebuild the manifest without re-hashing.
+    /// Hashes of OK and CHANGED files (path -> (`hash_hex`, size)), so the
+    /// manifest can be rebuilt without re-hashing. Empty unless requested.
     pub computed_hashes: HashMap<String, (String, u64)>,
 }
 
@@ -311,15 +310,18 @@ pub fn compute_with_threads(
 
 /// Verify files under `root_dir` against an existing manifest.
 pub fn check(root_dir: &Path, manifest: &Manifest) -> io::Result<VerifySummary> {
-    check_with_threads(root_dir, manifest, 1, None)
+    check_with_threads(root_dir, manifest, 1, None, true)
 }
 
 /// Verify with the specified number of threads.
+/// `keep_hashes` populates `VerifySummary::computed_hashes`; skip it when the
+/// manifest will not be rebuilt, as it costs two `String`s per file.
 pub fn check_with_threads(
     root_dir: &Path,
     manifest: &Manifest,
     threads: usize,
     progress: Option<&ProgressBar>,
+    keep_hashes: bool,
 ) -> io::Result<VerifySummary> {
     let threads = threads.max(1);
     let glob_set = build_glob_set(&manifest.exclude_patterns)?;
@@ -354,23 +356,25 @@ pub fn check_with_threads(
     };
     to_verify.extend(unseen);
 
-    enum CheckResult {
-        Ok(String, String, u64),      // path, hash_hex, size
-        Changed(String, String, u64), // path, hash_hex, size
-        Missing(String),
+    enum Status {
+        Ok,
+        Changed,
+        Missing,
     }
+    type Computed = Option<(String, u64)>;
 
-    let verify_one = |rel: &String, abs: &PathBuf| -> io::Result<CheckResult> {
+    let verify_one = |rel: &str, abs: &PathBuf| -> io::Result<(Status, Computed)> {
         let result = match hash_file_with_advise(abs, true) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => CheckResult::Missing(rel.clone()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (Status::Missing, None),
             Err(e) => return Err(e),
             Ok((hash, size)) => {
                 let hex = hash.to_hex().to_string();
-                if hex == manifest.entries[rel.as_str()].hash {
-                    CheckResult::Ok(rel.clone(), hex, size)
+                let status = if hex == manifest.entries[rel].hash {
+                    Status::Ok
                 } else {
-                    CheckResult::Changed(rel.clone(), hex, size)
-                }
+                    Status::Changed
+                };
+                (status, keep_hashes.then_some((hex, size)))
             }
         };
         if let Some(pb) = progress {
@@ -379,7 +383,7 @@ pub fn check_with_threads(
         Ok(result)
     };
 
-    let results: Vec<CheckResult> = if threads > 1 {
+    let results: Vec<(Status, Computed)> = if threads > 1 {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .build()
@@ -402,17 +406,14 @@ pub fn check_with_threads(
         new: new_files,
         ..VerifySummary::default()
     };
-    for result in results {
-        match result {
-            CheckResult::Ok(p, h, s) => {
-                summary.computed_hashes.insert(p, (h, s));
-                summary.ok += 1;
-            }
-            CheckResult::Changed(p, h, s) => {
-                summary.computed_hashes.insert(p.clone(), (h, s));
-                summary.changed.push(p);
-            }
-            CheckResult::Missing(p) => summary.missing.push(p),
+    for ((rel, _), (status, computed)) in to_verify.into_iter().zip(results) {
+        match status {
+            Status::Ok => summary.ok += 1,
+            Status::Changed => summary.changed.push(rel.clone()),
+            Status::Missing => summary.missing.push(rel.clone()),
+        }
+        if let Some(c) = computed {
+            summary.computed_hashes.insert(rel, c);
         }
     }
 
@@ -784,14 +785,26 @@ mod tests {
             v.sort();
             v
         };
-        let seq = check_with_threads(dir.path(), &manifest, 1, None).unwrap();
-        let par = check_with_threads(dir.path(), &manifest, 4, None).unwrap();
+        let seq = check_with_threads(dir.path(), &manifest, 1, None, true).unwrap();
+        let par = check_with_threads(dir.path(), &manifest, 4, None, true).unwrap();
 
         assert_eq!(sorted(par.changed), vec!["par_0.txt", "par_1.txt"]);
         assert_eq!(par.missing, vec!["par_2.txt"]);
         assert_eq!(par.new, vec!["brand_new.txt"]);
         assert_eq!(seq.ok, par.ok);
         assert_eq!(seq.computed_hashes, par.computed_hashes);
+    }
+
+    #[test]
+    fn test_check_without_keep_hashes_leaves_map_empty() {
+        let dir = create_test_dir();
+        let manifest = compute(dir.path()).unwrap();
+        fs::write(dir.path().join("file1.txt"), b"changed").unwrap();
+
+        let summary = check_with_threads(dir.path(), &manifest, 1, None, false).unwrap();
+        assert_eq!(summary.ok, 2);
+        assert_eq!(summary.changed, vec!["file1.txt"]);
+        assert!(summary.computed_hashes.is_empty());
     }
 
     #[test]

@@ -311,7 +311,7 @@ fn cmd_check(
         pb
     };
 
-    let summary = manifest::check_with_threads(dir, &m, threads, Some(&pb))
+    let summary = manifest::check_with_threads(dir, &m, threads, Some(&pb), prompt || accept_new)
         .inspect_err(|_| pb.finish_and_clear())
         .context("during verification")?;
     pb.finish_and_clear();
