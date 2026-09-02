@@ -351,9 +351,11 @@ fn cmd_check(
     let mut manifest_updated = false;
     if accept_new && only_new_differences(&summary) {
         // New files are the only difference: add them without asking.
+        ensure_rewritable(&m, &mpath)?;
         save_updated_manifest(dir, &summary, &m, &mpath, threads, quiet)?;
         manifest_updated = true;
     } else if prompt && has_differences {
+        ensure_rewritable(&m, &mpath)?;
         eprint!("\nUpdate manifest to reflect current state? [y/N] ");
         let _ = std::io::stderr().flush();
         let mut input = String::new();
@@ -374,6 +376,16 @@ fn cmd_check(
 /// True when new files are the only kind of difference found.
 fn only_new_differences(summary: &manifest::VerifySummary) -> bool {
     !summary.new.is_empty() && summary.changed.is_empty() && summary.missing.is_empty()
+}
+
+/// Refuse to update a manifest written by a newer format; `check` alone still works.
+fn ensure_rewritable(m: &manifest::Manifest, mpath: &std::path::Path) -> Result<(), AppError> {
+    m.ensure_rewritable().with_context(|| {
+        format!(
+            "cannot update manifest '{}' (re-run without --accept-new/--prompt, or upgrade integritas)",
+            mpath.display()
+        )
+    })
 }
 
 /// Rebuild the manifest from check results and save it over `mpath`.

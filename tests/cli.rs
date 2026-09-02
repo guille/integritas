@@ -178,20 +178,51 @@ fn missing_manifest_is_an_error() {
     );
 }
 
-#[test]
-fn unsupported_manifest_version_is_an_error() {
-    let dir = setup();
-    let mpath = dir.path().join(".integritas-manifest.json");
-    let future = manifest_contents(dir.path()).replace("\"version\": 1", "\"version\": 99");
+/// Rewrite the manifest as if a future format wrote it.
+fn write_future_manifest(dir: &Path, min_reader_version: u32) {
+    let mpath = dir.join(".integritas-manifest.json");
+    let future = manifest_contents(dir)
+        .replace("\"version\": 2", "\"version\": 99")
+        .replace(
+            "\"min_reader_version\": 2",
+            &format!("\"min_reader_version\": {min_reader_version}"),
+        );
     fs::write(&mpath, future).unwrap();
+}
+
+#[test]
+fn unreadable_manifest_version_is_an_error() {
+    let dir = setup();
+    write_future_manifest(dir.path(), 99);
 
     let out = run(dir.path(), &["check", "."]);
     assert_eq!(exit_code(&out), 1);
     assert!(
-        stderr(&out).contains("unsupported manifest version 99"),
+        stderr(&out).contains("requires format version 99"),
         "stderr: {}",
         stderr(&out)
     );
+}
+
+#[test]
+fn newer_but_readable_manifest_checks_fine_and_refuses_update() {
+    let dir = setup();
+    write_future_manifest(dir.path(), 2);
+    fs::write(dir.path().join("c.txt"), b"new").unwrap();
+    let before = manifest_contents(dir.path());
+
+    let out = run(dir.path(), &["check", "."]);
+    assert_eq!(exit_code(&out), 1);
+    assert!(stdout(&out).contains("NEW:     c.txt"));
+
+    let out = run(dir.path(), &["check", ".", "--accept-new"]);
+    assert_eq!(exit_code(&out), 1);
+    assert!(
+        stderr(&out).contains("cannot update manifest"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    assert_eq!(manifest_contents(dir.path()), before);
 }
 
 #[test]

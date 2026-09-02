@@ -22,14 +22,33 @@ pub struct ManifestEntry {
     pub last_verified: DateTime<Utc>,
 }
 
-/// The manifest format version this build reads and writes.
-pub const MANIFEST_VERSION: u32 = 1;
+/// The manifest format version this build writes.
+pub const MANIFEST_VERSION: u32 = 2;
+
+/// Oldest format version that can read files this build writes.
+/// Only bumps when a field is removed or changes meaning.
+pub const MIN_READER_VERSION: u32 = 2;
+
+fn v1() -> u32 {
+    1
+}
+
+/// Version fields only, for diagnosing a failed full parse.
+#[derive(Deserialize)]
+struct Header {
+    #[serde(default = "v1")]
+    min_reader_version: u32,
+}
 
 /// The full manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
-    /// Version of the manifest format.
+    /// Format version of the build that wrote this file.
     pub version: u32,
+    /// Oldest format version that can read this file correctly.
+    /// Absent in v1 files.
+    #[serde(default = "v1")]
+    pub min_reader_version: u32,
     /// Glob patterns used to exclude files during compute.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclude_patterns: Vec<String>,
@@ -47,27 +66,44 @@ impl Manifest {
     pub fn new() -> Self {
         Self {
             version: MANIFEST_VERSION,
+            min_reader_version: MIN_READER_VERSION,
             exclude_patterns: Vec::new(),
             entries: HashMap::new(),
         }
     }
 
     /// Load a manifest from a JSON file.
-    /// Fails with `InvalidData` on malformed JSON or an unsupported version.
+    /// Fails with `InvalidData` on malformed JSON or a format this build cannot read.
     pub fn load(path: &Path) -> io::Result<Self> {
         let content = fs::read_to_string(path)?;
-        let manifest: Self = serde_json::from_str(&content)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        if manifest.version != MANIFEST_VERSION {
+        let manifest: Self = match serde_json::from_str(&content) {
+            Ok(m) => m,
+            Err(e) => {
+                // A newer format may have dropped a field we require.
+                if let Ok(header) = serde_json::from_str::<Header>(&content) {
+                    check_readable(header.min_reader_version)?;
+                }
+                return Err(io::Error::new(io::ErrorKind::InvalidData, e));
+            }
+        };
+        check_readable(manifest.min_reader_version)?;
+        Ok(manifest)
+    }
+
+    /// Fail if rewriting this manifest with this build would lose data.
+    /// Update paths rebuild from scratch, so fields of a newer format are dropped.
+    pub fn ensure_rewritable(&self) -> io::Result<()> {
+        if self.version > MANIFEST_VERSION {
             return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
+                io::ErrorKind::Unsupported,
                 format!(
-                    "unsupported manifest version {} (this build supports version {MANIFEST_VERSION})",
-                    manifest.version
+                    "manifest format version {} is newer than this build writes ({MANIFEST_VERSION}); \
+                     rewriting it would drop fields this build does not understand",
+                    self.version
                 ),
             ));
         }
-        Ok(manifest)
+        Ok(())
     }
 
     /// Save the manifest to a JSON file atomically (write to tmp, then rename).
@@ -83,6 +119,19 @@ impl Manifest {
             let _ = fs::remove_file(&tmp_path);
         })
     }
+}
+
+fn check_readable(min_reader_version: u32) -> io::Result<()> {
+    if min_reader_version > MANIFEST_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "manifest requires format version {min_reader_version} or newer to read \
+                 (this build supports {MANIFEST_VERSION}); upgrade integritas"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Build a `GlobSet` from a list of patterns.
@@ -792,16 +841,85 @@ mod tests {
     }
 
     #[test]
-    fn test_load_rejects_unsupported_version() {
+    fn test_load_rejects_unreadable_min_reader_version() {
+        let dir = create_test_dir();
+        let mut manifest = compute(dir.path()).unwrap();
+        manifest.version = MANIFEST_VERSION + 1;
+        manifest.min_reader_version = MANIFEST_VERSION + 1;
+        let path = dir.path().join("future.json");
+        manifest.save(&path).unwrap();
+
+        let err = Manifest::load(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("requires format version"));
+    }
+
+    #[test]
+    fn test_load_accepts_newer_version_with_compatible_reader() {
+        // An additive future format keeps min_reader_version at ours.
         let dir = create_test_dir();
         let mut manifest = compute(dir.path()).unwrap();
         manifest.version = MANIFEST_VERSION + 1;
         let path = dir.path().join("future.json");
         manifest.save(&path).unwrap();
 
+        let loaded = Manifest::load(&path).unwrap();
+        assert_eq!(loaded.version, MANIFEST_VERSION + 1);
+        assert_eq!(loaded.entries.len(), 3);
+    }
+
+    #[test]
+    fn test_load_reports_version_when_newer_format_fails_to_parse() {
+        // A breaking future format that dropped `size`.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("future.json");
+        let content = format!(
+            r#"{{"version": {v}, "min_reader_version": {v}, "entries": {{"a": {{"hash": "00"}}}}}}"#,
+            v = MANIFEST_VERSION + 1
+        );
+        fs::write(&path, content).unwrap();
+
         let err = Manifest::load(&path).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(err.to_string().contains("unsupported manifest version"));
+        assert!(err.to_string().contains("requires format version"));
+        assert!(!err.to_string().contains("missing field"));
+    }
+
+    #[test]
+    fn test_load_v1_manifest() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v1.json");
+        fs::write(
+            &path,
+            br#"{
+  "version": 1,
+  "exclude_patterns": ["*.tmp"],
+  "entries": {
+    "a.txt": {
+      "hash": "ea8f163db38682925e4491c5e58d4bb3506ef8c14eb78a86e908c5624a67200f",
+      "size": 5,
+      "last_verified": "2026-09-02T12:34:56.789012345Z"
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        let loaded = Manifest::load(&path).unwrap();
+        assert_eq!(loaded.version, 1);
+        assert_eq!(loaded.min_reader_version, 1);
+        assert_eq!(loaded.exclude_patterns, vec!["*.tmp"]);
+        assert_eq!(loaded.entries["a.txt"].size, 5);
+        loaded.ensure_rewritable().unwrap();
+    }
+
+    #[test]
+    fn test_ensure_rewritable_refuses_newer_version() {
+        let mut manifest = Manifest::new();
+        manifest.ensure_rewritable().unwrap();
+        manifest.version = MANIFEST_VERSION + 1;
+        let err = manifest.ensure_rewritable().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
     }
 
     #[test]
