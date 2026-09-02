@@ -1,4 +1,3 @@
-use chrono::{DateTime, Utc};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use indicatif::ProgressBar;
 use rayon::prelude::*;
@@ -18,8 +17,6 @@ pub struct ManifestEntry {
     pub hash: String,
     /// File size in bytes.
     pub size: u64,
-    /// Timestamp of when this entry was last verified.
-    pub last_verified: DateTime<Utc>,
 }
 
 /// The manifest format version this build writes.
@@ -178,7 +175,6 @@ pub struct VerifySummary {
 fn hash_entry(
     abs: &Path,
     rel: &str,
-    now: DateTime<Utc>,
     progress: Option<&ProgressBar>,
 ) -> io::Result<(String, ManifestEntry)> {
     let (hash, size) = hash_file_with_advise(abs, true)?;
@@ -190,7 +186,6 @@ fn hash_entry(
         ManifestEntry {
             hash: hash.to_hex().to_string(),
             size,
-            last_verified: now,
         },
     ))
 }
@@ -200,7 +195,6 @@ fn hash_entry(
 fn hash_all(
     files: &[(&Path, &str)],
     threads: usize,
-    now: DateTime<Utc>,
     progress: Option<&ProgressBar>,
 ) -> io::Result<Vec<(String, ManifestEntry)>> {
     if threads > 1 && files.len() > 1 {
@@ -212,13 +206,13 @@ fn hash_all(
         pool.install(|| {
             files
                 .par_iter()
-                .map(|(abs, rel)| hash_entry(abs, rel, now, progress))
+                .map(|(abs, rel)| hash_entry(abs, rel, progress))
                 .collect()
         })
     } else {
         files
             .iter()
-            .map(|(abs, rel)| hash_entry(abs, rel, now, progress))
+            .map(|(abs, rel)| hash_entry(abs, rel, progress))
             .collect()
     }
 }
@@ -234,7 +228,6 @@ pub fn compute_append(
     excludes: &[String],
     progress: Option<&ProgressBar>,
 ) -> io::Result<Manifest> {
-    let now = Utc::now();
     let threads = threads.max(1);
 
     // Merge excludes: keep existing manifest's excludes + new CLI excludes
@@ -272,7 +265,7 @@ pub fn compute_append(
         .iter()
         .map(|f| (f.abs.as_path(), f.rel.as_str()))
         .collect();
-    for (key, entry) in hash_all(&to_hash, threads, now, progress)? {
+    for (key, entry) in hash_all(&to_hash, threads, progress)? {
         manifest.entries.insert(key, entry);
     }
 
@@ -296,7 +289,6 @@ pub fn compute_with_threads(
     progress: Option<&ProgressBar>,
     excludes: &[String],
 ) -> io::Result<Manifest> {
-    let now = Utc::now();
     let threads = threads.max(1);
 
     // Single walk: prunes excluded dirs and returns files in inode order
@@ -311,7 +303,7 @@ pub fn compute_with_threads(
         .iter()
         .map(|f| (f.abs.as_path(), f.rel.as_str()))
         .collect();
-    for (key, entry) in hash_all(&to_hash, threads, now, progress)? {
+    for (key, entry) in hash_all(&to_hash, threads, progress)? {
         m.entries.insert(key, entry);
     }
     Ok(m)
@@ -458,7 +450,6 @@ pub fn build_updated_manifest(
     threads: usize,
     progress: Option<&ProgressBar>,
 ) -> io::Result<Manifest> {
-    let now = Utc::now();
     let threads = threads.max(1);
 
     let mut m = Manifest::new();
@@ -472,7 +463,6 @@ pub fn build_updated_manifest(
             ManifestEntry {
                 hash: hash.clone(),
                 size: *size,
-                last_verified: now,
             },
         );
     }
@@ -484,7 +474,7 @@ pub fn build_updated_manifest(
         .zip(&summary.new)
         .map(|(abs, rel)| (abs.as_path(), rel.as_str()))
         .collect();
-    for (key, entry) in hash_all(&to_hash, threads, now, progress)? {
+    for (key, entry) in hash_all(&to_hash, threads, progress)? {
         m.entries.insert(key, entry);
     }
 
