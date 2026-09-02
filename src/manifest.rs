@@ -149,15 +149,6 @@ pub fn build_glob_set(patterns: &[String]) -> io::Result<Option<GlobSet>> {
     Ok(Some(set))
 }
 
-/// Result of verifying a single file.
-#[derive(Debug, PartialEq)]
-pub enum VerifyStatus {
-    Ok,
-    Changed,
-    Missing,
-    New,
-}
-
 /// Summary of a verification run.
 #[derive(Debug, Default)]
 pub struct VerifySummary {
