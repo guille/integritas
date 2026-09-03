@@ -1,6 +1,7 @@
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use integritas::manifest::{Manifest, ManifestEntry};
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
+use integritas::manifest::{Manifest, ManifestEntry, PathMap, PathSet};
 use std::fs;
+use std::hint::black_box;
 use std::io::Write;
 use tempfile::TempDir;
 
@@ -119,10 +120,80 @@ fn bench_manifest_io(c: &mut Criterion) {
     group.finish();
 }
 
+/// The path-keyed map work a `check --update` run does, isolated from file I/O
+/// so the hasher is visible: one `contains_key` per walked file, the `seen` set
+/// that finds manifest entries the walk missed, one index lookup per verified
+/// file, and the inserts that `load` and `compute` do to build the map.
+fn bench_manifest_lookup(c: &mut Criterion) {
+    let mut group = c.benchmark_group("manifest_lookup");
+    group.sample_size(20);
+
+    for n in [10_000usize, 100_000] {
+        let label = format!("{}k", n / 1000);
+        let manifest = synthetic_manifest(n);
+        let keys: Vec<String> = manifest.entries.keys().cloned().collect();
+
+        group.throughput(Throughput::Elements(n as u64));
+
+        group.bench_with_input(BenchmarkId::new("insert", &label), &n, |b, _| {
+            b.iter_batched(
+                || keys.clone(),
+                |ks| {
+                    let mut m: PathMap<u64> = PathMap::default();
+                    m.reserve(ks.len());
+                    for (i, k) in ks.into_iter().enumerate() {
+                        m.insert(k, i as u64);
+                    }
+                    m
+                },
+                BatchSize::LargeInput,
+            );
+        });
+
+        group.bench_with_input(BenchmarkId::new("contains_key", &label), &n, |b, _| {
+            b.iter(|| {
+                let mut hits = 0usize;
+                for k in &keys {
+                    if manifest.entries.contains_key(k.as_str()) {
+                        hits += 1;
+                    }
+                }
+                black_box(hits)
+            });
+        });
+
+        group.bench_with_input(BenchmarkId::new("unseen_scan", &label), &n, |b, _| {
+            b.iter(|| {
+                let seen: PathSet = keys.iter().map(String::as_str).collect();
+                black_box(
+                    manifest
+                        .entries
+                        .keys()
+                        .filter(|rel| !seen.contains(rel.as_str()))
+                        .count(),
+                )
+            });
+        });
+
+        group.bench_with_input(BenchmarkId::new("index", &label), &n, |b, _| {
+            b.iter(|| {
+                let mut total = 0usize;
+                for k in &keys {
+                    total += manifest.entries[k.as_str()].hash.len();
+                }
+                black_box(total)
+            });
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_hash_throughput,
     bench_many_files,
-    bench_manifest_io
+    bench_manifest_io,
+    bench_manifest_lookup
 );
 criterion_main!(benches);

@@ -2,7 +2,7 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use indicatif::ProgressBar;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::io::Write;
@@ -10,6 +10,15 @@ use std::path::{Path, PathBuf};
 
 use crate::hash::hash_file_with_advise;
 use crate::io_utils;
+
+/// Hasher for the path-keyed collections below. Keys are relative paths from
+/// walking a user-nominated tree, so std's HashDoS-resistant `SipHash` buys
+/// nothing an attacker with write access to that tree could not bypass anyway.
+pub type PathHasher = foldhash::fast::RandomState;
+
+/// A collection keyed by relative path.
+pub type PathMap<V> = HashMap<String, V, PathHasher>;
+pub type PathSet<'a> = HashSet<&'a str, PathHasher>;
 
 /// A single entry in the manifest.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -56,14 +65,14 @@ pub struct Manifest {
     pub exclude_patterns: Vec<String>,
     /// Entries keyed by relative path.
     #[serde(serialize_with = "serialize_sorted")]
-    pub entries: HashMap<String, ManifestEntry>,
+    pub entries: PathMap<ManifestEntry>,
 }
 
 /// Emit entries in key order. `HashMap` iteration order is randomized per
 /// process, so without this two saves of an identical manifest differ byte for
 /// byte, which makes manifests noisy under `git diff`.
 fn serialize_sorted<S: serde::Serializer>(
-    entries: &HashMap<String, ManifestEntry>,
+    entries: &PathMap<ManifestEntry>,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     use serde::ser::SerializeMap;
@@ -90,7 +99,7 @@ impl Manifest {
             version: MANIFEST_VERSION,
             min_reader_version: MIN_READER_VERSION,
             exclude_patterns: Vec::new(),
-            entries: HashMap::new(),
+            entries: PathMap::default(),
         }
     }
 
@@ -194,7 +203,7 @@ pub struct VerifySummary {
     pub new: Vec<String>,
     /// Hashes of OK and CHANGED files (path -> (`hash_hex`, size)), so the
     /// manifest can be rebuilt without re-hashing. Empty unless requested.
-    pub computed_hashes: HashMap<String, (String, u64)>,
+    pub computed_hashes: PathMap<(String, u64)>,
 }
 
 /// Hash one file and build its manifest entry, ticking the progress bar.
@@ -372,8 +381,7 @@ pub fn check_with_threads(
     // compute) — try to hash them and let NotFound decide. These have no
     // dirent to read an inode from, so they're appended out of inode order.
     let unseen: Vec<(String, PathBuf)> = {
-        let seen: std::collections::HashSet<&str> =
-            to_verify.iter().map(|(rel, _)| rel.as_str()).collect();
+        let seen: PathSet = to_verify.iter().map(|(rel, _)| rel.as_str()).collect();
         manifest
             .entries
             .keys()
