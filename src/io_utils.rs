@@ -117,6 +117,38 @@ mod tests {
         assert_eq!(rels, vec!["keep.txt"]);
     }
 
+    /// `manifest::unseen_entries` shortcuts on the walked count matching the
+    /// manifest's, which is only sound while no path is yielded twice.
+    #[test]
+    fn test_walk_files_yields_unique_relative_paths() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join("real")).unwrap();
+        fs::write(dir.path().join("real/a.txt"), b"a").unwrap();
+        // A second path to the same inode.
+        fs::hard_link(dir.path().join("real/a.txt"), dir.path().join("real/b.txt")).unwrap();
+        // Two more routes to the same files, plus a cycle back to the root.
+        symlink(dir.path().join("real"), dir.path().join("link_dir")).unwrap();
+        symlink(
+            dir.path().join("real/a.txt"),
+            dir.path().join("link_file.txt"),
+        )
+        .unwrap();
+        symlink(dir.path(), dir.path().join("real/loop")).unwrap();
+
+        let files = walk_files(dir.path(), None).unwrap();
+        let rels: Vec<&str> = files.iter().map(|f| f.rel.as_str()).collect();
+        let unique: std::collections::HashSet<&str> = rels.iter().copied().collect();
+        assert_eq!(rels.len(), unique.len(), "duplicate path in {rels:?}");
+
+        // Symlinks are not followed, so neither the aliases nor the cycle are
+        // walked; the hardlink is a distinct path and counts on its own.
+        let mut sorted = rels;
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec!["real/a.txt", "real/b.txt"]);
+    }
+
     #[test]
     fn test_rejects_non_utf8_path() {
         use std::ffi::OsStr;

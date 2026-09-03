@@ -349,6 +349,31 @@ pub fn check(root_dir: &Path, manifest: &Manifest) -> io::Result<VerifySummary> 
     check_with_threads(root_dir, manifest, 1, None, true)
 }
 
+/// Manifest entries the walk didn't yield. Usually they are missing, but they
+/// may just be hidden from the walk (e.g. behind an exclude pattern added after
+/// compute), so the caller hashes them and lets `NotFound` tell the two apart.
+///
+/// `to_verify` holds only keys taken from `entries`, making it a subset of them,
+/// so equal lengths mean every entry was seen and none needs probing. That
+/// shortcut is sound only while `to_verify` is duplicate-free, which holds
+/// because `walk_files` yields each path once.
+fn unseen_entries(
+    to_verify: &[(String, PathBuf)],
+    entries: &PathMap<ManifestEntry>,
+    root_dir: &Path,
+) -> Vec<(String, PathBuf)> {
+    if to_verify.len() == entries.len() {
+        return Vec::new();
+    }
+
+    let seen: PathSet = to_verify.iter().map(|(rel, _)| rel.as_str()).collect();
+    entries
+        .keys()
+        .filter(|rel| !seen.contains(rel.as_str()))
+        .map(|rel| (rel.clone(), root_dir.join(rel)))
+        .collect()
+}
+
 /// Verify with the specified number of threads.
 /// `keep_hashes` populates `VerifySummary::computed_hashes`; skip it when the
 /// manifest will not be rebuilt, as it costs two `String`s per file.
@@ -376,19 +401,8 @@ pub fn check_with_threads(
         }
     }
 
-    // Manifest entries the walk didn't see are usually missing, but may just
-    // be hidden from the walk (e.g. behind an exclude pattern added after
-    // compute) — try to hash them and let NotFound decide. These have no
-    // dirent to read an inode from, so they're appended out of inode order.
-    let unseen: Vec<(String, PathBuf)> = {
-        let seen: PathSet = to_verify.iter().map(|(rel, _)| rel.as_str()).collect();
-        manifest
-            .entries
-            .keys()
-            .filter(|rel| !seen.contains(rel.as_str()))
-            .map(|rel| (rel.clone(), root_dir.join(rel)))
-            .collect()
-    };
+    // These have no dirent to read an inode from, so they land out of inode order.
+    let unseen = unseen_entries(&to_verify, &manifest.entries, root_dir);
     to_verify.extend(unseen);
 
     enum Status {
@@ -797,6 +811,195 @@ mod tests {
         fs::remove_file(dir.path().join("file1.txt")).unwrap();
         let summary = check(dir.path(), &manifest).unwrap();
         assert_eq!(summary.missing, vec!["file1.txt"]);
+    }
+
+    /// `unseen_entries` without its equal-length shortcut.
+    fn unseen_reference(
+        to_verify: &[(String, PathBuf)],
+        entries: &PathMap<ManifestEntry>,
+        root_dir: &Path,
+    ) -> Vec<(String, PathBuf)> {
+        let seen: PathSet = to_verify.iter().map(|(rel, _)| rel.as_str()).collect();
+        entries
+            .keys()
+            .filter(|rel| !seen.contains(rel.as_str()))
+            .map(|rel| (rel.clone(), root_dir.join(rel)))
+            .collect()
+    }
+
+    fn entry_map(keys: &[String]) -> PathMap<ManifestEntry> {
+        let mut entries = PathMap::default();
+        for key in keys {
+            entries.insert(
+                key.clone(),
+                ManifestEntry {
+                    hash: String::new(),
+                    size: 0,
+                },
+            );
+        }
+        entries
+    }
+
+    /// Every possible combination of seen/unseen entries, checked against the
+    /// unconditional implementation the shortcut replaced.
+    #[test]
+    fn test_unseen_entries_matches_reference_for_every_subset() {
+        const N: usize = 10;
+        let root = Path::new("/root");
+        let keys: Vec<String> = (0..N).map(|i| format!("dir_{i}/file_{i}.txt")).collect();
+        let entries = entry_map(&keys);
+
+        for mask in 0..(1u32 << N) {
+            let to_verify: Vec<(String, PathBuf)> = keys
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| mask & (1u32 << i) != 0)
+                .map(|(_, key)| (key.clone(), root.join(key)))
+                .collect();
+
+            let mut actual = unseen_entries(&to_verify, &entries, root);
+            let mut expected = unseen_reference(&to_verify, &entries, root);
+            actual.sort();
+            expected.sort();
+
+            assert_eq!(actual, expected, "mask {mask:#012b}");
+            assert_eq!(actual.len(), N - to_verify.len(), "mask {mask:#012b}");
+        }
+    }
+
+    #[test]
+    fn test_unseen_entries_on_empty_manifest() {
+        let root = Path::new("/root");
+        let entries = entry_map(&[]);
+        assert!(unseen_entries(&[], &entries, root).is_empty());
+    }
+
+    #[test]
+    fn test_unseen_entries_resolves_against_root() {
+        let root = Path::new("/root");
+        let keys = vec!["a/b.txt".to_string(), "c.txt".to_string()];
+        let entries = entry_map(&keys);
+        let to_verify = vec![("c.txt".to_string(), root.join("c.txt"))];
+
+        assert_eq!(
+            unseen_entries(&to_verify, &entries, root),
+            vec![("a/b.txt".to_string(), PathBuf::from("/root/a/b.txt"))]
+        );
+    }
+
+    #[test]
+    fn test_check_new_file_alone_keeps_entry_counts_equal() {
+        // A new file goes to `new`, never `to_verify`, so the counts still match
+        // and the unseen scan is skipped. Nothing may be lost by that.
+        let dir = create_test_dir();
+        let manifest = compute(dir.path()).unwrap();
+        fs::write(dir.path().join("extra.txt"), b"extra").unwrap();
+
+        let summary = check(dir.path(), &manifest).unwrap();
+        assert_eq!(summary.ok, 3);
+        assert_eq!(summary.new, vec!["extra.txt"]);
+        assert!(summary.missing.is_empty());
+        assert!(summary.changed.is_empty());
+    }
+
+    #[test]
+    fn test_check_changed_file_keeps_entry_counts_equal() {
+        let dir = create_test_dir();
+        let manifest = compute(dir.path()).unwrap();
+        fs::write(dir.path().join("file1.txt"), b"modified").unwrap();
+
+        let summary = check(dir.path(), &manifest).unwrap();
+        assert_eq!(summary.ok, 2);
+        assert_eq!(summary.changed, vec!["file1.txt"]);
+        assert!(summary.missing.is_empty());
+    }
+
+    #[test]
+    fn test_check_missing_and_new_together() {
+        let dir = create_test_dir();
+        let manifest = compute(dir.path()).unwrap();
+        fs::remove_file(dir.path().join("file2.txt")).unwrap();
+        fs::write(dir.path().join("replacement.txt"), b"replacement").unwrap();
+
+        let summary = check(dir.path(), &manifest).unwrap();
+        assert_eq!(summary.ok, 2);
+        assert_eq!(summary.missing, vec!["file2.txt"]);
+        assert_eq!(summary.new, vec!["replacement.txt"]);
+    }
+
+    /// The trap case for a count-based shortcut: as many new files as missing
+    /// ones, so the walk yields exactly as many paths as the manifest holds.
+    #[test]
+    fn test_check_every_file_replaced_by_a_new_one() {
+        let dir = create_test_dir();
+        let manifest = compute(dir.path()).unwrap();
+        for name in ["file1.txt", "file2.txt", "sub/file3.txt"] {
+            fs::remove_file(dir.path().join(name)).unwrap();
+        }
+        for name in ["new1.txt", "new2.txt", "sub/new3.txt"] {
+            fs::write(dir.path().join(name), b"new").unwrap();
+        }
+
+        let summary = check(dir.path(), &manifest).unwrap();
+        let sorted = |mut v: Vec<String>| {
+            v.sort();
+            v
+        };
+        assert_eq!(summary.ok, 0);
+        assert_eq!(
+            sorted(summary.missing),
+            vec!["file1.txt", "file2.txt", "sub/file3.txt"]
+        );
+        assert_eq!(
+            sorted(summary.new),
+            vec!["new1.txt", "new2.txt", "sub/new3.txt"]
+        );
+    }
+
+    #[test]
+    fn test_check_empty_manifest_against_empty_dir() {
+        let dir = TempDir::new().unwrap();
+        let summary = check(dir.path(), &Manifest::new()).unwrap();
+        assert_eq!(summary.ok, 0);
+        assert!(summary.missing.is_empty());
+        assert!(summary.new.is_empty());
+    }
+
+    #[test]
+    fn test_check_empty_manifest_reports_everything_new() {
+        let dir = create_test_dir();
+        let summary = check(dir.path(), &Manifest::new()).unwrap();
+        assert_eq!(summary.ok, 0);
+        assert_eq!(summary.new.len(), 3);
+        assert!(summary.missing.is_empty());
+    }
+
+    #[test]
+    fn test_check_empty_dir_reports_everything_missing() {
+        let dir = create_test_dir();
+        let manifest = compute(dir.path()).unwrap();
+        for name in ["file1.txt", "file2.txt", "sub/file3.txt"] {
+            fs::remove_file(dir.path().join(name)).unwrap();
+        }
+
+        let summary = check(dir.path(), &manifest).unwrap();
+        assert_eq!(summary.ok, 0);
+        assert_eq!(summary.missing.len(), 3);
+        assert!(summary.new.is_empty());
+    }
+
+    #[test]
+    fn test_check_late_exclude_hiding_entry_plus_new_file() {
+        let dir = create_test_dir();
+        let mut manifest = compute(dir.path()).unwrap();
+        manifest.exclude_patterns.push("file1.txt".to_string());
+        fs::write(dir.path().join("extra.txt"), b"extra").unwrap();
+
+        let summary = check(dir.path(), &manifest).unwrap();
+        assert_eq!(summary.ok, 3);
+        assert_eq!(summary.new, vec!["extra.txt"]);
+        assert!(summary.missing.is_empty());
     }
 
     #[test]

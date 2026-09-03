@@ -121,9 +121,13 @@ fn bench_manifest_io(c: &mut Criterion) {
 }
 
 /// The path-keyed map work a `check --update` run does, isolated from file I/O
-/// so the hasher is visible: one `contains_key` per walked file, the `seen` set
-/// that finds manifest entries the walk missed, one index lookup per verified
-/// file, and the inserts that `load` and `compute` do to build the map.
+/// so the hasher is visible: one `contains_key` per walked file, one index
+/// lookup per verified file, and the inserts that `load` and `compute` do to
+/// build the map.
+///
+/// `unseen_scan` is the odd one out — `check` skips it whenever the walked count
+/// matches the manifest's, so this measures the cost avoided in that case rather
+/// than cost still being paid.
 fn bench_manifest_lookup(c: &mut Criterion) {
     let mut group = c.benchmark_group("manifest_lookup");
     group.sample_size(20);
