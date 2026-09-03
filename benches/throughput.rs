@@ -1,4 +1,5 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use integritas::manifest::{Manifest, ManifestEntry};
 use std::fs;
 use std::io::Write;
 use tempfile::TempDir;
@@ -64,5 +65,64 @@ fn bench_many_files(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_hash_throughput, bench_many_files);
+/// A manifest with `n` entries shaped like a real source tree: nested relative
+/// paths around 40 bytes and 64-char hex hashes.
+fn synthetic_manifest(n: usize) -> Manifest {
+    let mut m = Manifest::new();
+    m.entries.reserve(n);
+    for i in 0..n {
+        let path = format!(
+            "src/component_{:02}/module_{:03}/file_{:06}.rs",
+            i % 32,
+            (i / 32) % 128,
+            i
+        );
+        let hash = blake3::hash(path.as_bytes()).to_hex().to_string();
+        m.entries.insert(
+            path,
+            ManifestEntry {
+                hash,
+                size: (i as u64 * 977) % 4_000_000,
+            },
+        );
+    }
+    m
+}
+
+fn bench_manifest_io(c: &mut Criterion) {
+    let dir = TempDir::new().unwrap();
+
+    let mut group = c.benchmark_group("manifest_io");
+    // A 100k-entry save/load pair is ~10 ms of real work; the default 100
+    // samples would make this group dominate the suite's runtime.
+    group.sample_size(20);
+
+    for n in [10_000usize, 100_000] {
+        let label = format!("{}k", n / 1000);
+        let manifest = synthetic_manifest(n);
+
+        let save_path = dir.path().join(format!("save_{n}.json"));
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_with_input(BenchmarkId::new("save", &label), &n, |b, _| {
+            b.iter(|| manifest.save(&save_path).unwrap());
+        });
+
+        let load_path = dir.path().join(format!("load_{n}.json"));
+        manifest.save(&load_path).unwrap();
+        let bytes = fs::metadata(&load_path).unwrap().len();
+        group.throughput(Throughput::Bytes(bytes));
+        group.bench_with_input(BenchmarkId::new("load", &label), &n, |b, _| {
+            b.iter(|| Manifest::load(&load_path).unwrap());
+        });
+    }
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_hash_throughput,
+    bench_many_files,
+    bench_manifest_io
+);
 criterion_main!(benches);

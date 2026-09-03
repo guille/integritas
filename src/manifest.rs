@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::hash::hash_file_with_advise;
@@ -18,6 +19,10 @@ pub struct ManifestEntry {
     /// File size in bytes.
     pub size: u64,
 }
+
+/// Buffer for streaming the manifest out; `to_writer_pretty` issues many tiny
+/// writes, so the default 8 KiB would mean thousands of syscalls.
+const WRITE_BUF_SIZE: usize = 256 * 1024;
 
 /// The manifest format version this build writes.
 pub const MANIFEST_VERSION: u32 = 2;
@@ -50,7 +55,27 @@ pub struct Manifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclude_patterns: Vec<String>,
     /// Entries keyed by relative path.
+    #[serde(serialize_with = "serialize_sorted")]
     pub entries: HashMap<String, ManifestEntry>,
+}
+
+/// Emit entries in key order. `HashMap` iteration order is randomized per
+/// process, so without this two saves of an identical manifest differ byte for
+/// byte, which makes manifests noisy under `git diff`.
+fn serialize_sorted<S: serde::Serializer>(
+    entries: &HashMap<String, ManifestEntry>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+
+    let mut pairs: Vec<(&String, &ManifestEntry)> = entries.iter().collect();
+    pairs.sort_unstable_by(|a, b| a.0.cmp(b.0));
+
+    let mut map = serializer.serialize_map(Some(pairs.len()))?;
+    for (key, entry) in pairs {
+        map.serialize_entry(key, entry)?;
+    }
+    map.end()
 }
 
 impl Default for Manifest {
@@ -72,6 +97,8 @@ impl Manifest {
     /// Load a manifest from a JSON file.
     /// Fails with `InvalidData` on malformed JSON or a format this build cannot read.
     pub fn load(path: &Path) -> io::Result<Self> {
+        // Keep `read_to_string` + `from_str`: one bulk UTF-8 pass is cheaper
+        // than the per-string validation `from_slice`'s reader has to do.
         let content = fs::read_to_string(path)?;
         let manifest: Self = match serde_json::from_str(&content) {
             Ok(m) => m,
@@ -105,16 +132,25 @@ impl Manifest {
 
     /// Save the manifest to a JSON file atomically (write to tmp, then rename).
     pub fn save(&self, path: &Path) -> io::Result<()> {
-        let content = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
-
         // Write to a sibling temp file, then atomically rename
         let dir = path.parent().unwrap_or(Path::new("."));
         let tmp_path = dir.join(format!(".integritas-manifest-{}.tmp", std::process::id()));
-        fs::write(&tmp_path, &content)?;
-        fs::rename(&tmp_path, path).inspect_err(|_| {
-            // Clean up tmp on rename failure
-            let _ = fs::remove_file(&tmp_path);
-        })
+
+        // Serializing straight into the file avoids materializing the whole
+        // document as a String first, which on a large manifest is a second
+        // copy of the output and the peak of the process.
+        let write = || -> io::Result<()> {
+            let mut writer =
+                io::BufWriter::with_capacity(WRITE_BUF_SIZE, fs::File::create(&tmp_path)?);
+            serde_json::to_writer_pretty(&mut writer, self).map_err(io::Error::other)?;
+            writer.flush()
+        };
+
+        write()
+            .and_then(|()| fs::rename(&tmp_path, path))
+            .inspect_err(|_| {
+                let _ = fs::remove_file(&tmp_path);
+            })
     }
 }
 
@@ -823,6 +859,34 @@ mod tests {
             assert_eq!(entry.hash, par_entry.hash, "hash mismatch for {path}");
             assert_eq!(entry.size, par_entry.size);
         }
+    }
+
+    #[test]
+    fn test_save_is_byte_identical_regardless_of_insertion_order() {
+        let dir = TempDir::new().unwrap();
+
+        let entry = |i: u32| ManifestEntry {
+            hash: format!("{i:064x}"),
+            size: u64::from(i),
+        };
+
+        let mut forward = Manifest::new();
+        let mut backward = Manifest::new();
+        for i in 0..64u32 {
+            forward.entries.insert(format!("path/{i:03}.txt"), entry(i));
+        }
+        for i in (0..64u32).rev() {
+            backward
+                .entries
+                .insert(format!("path/{i:03}.txt"), entry(i));
+        }
+
+        let a = dir.path().join("a.json");
+        let b = dir.path().join("b.json");
+        forward.save(&a).unwrap();
+        backward.save(&b).unwrap();
+
+        assert_eq!(fs::read(&a).unwrap(), fs::read(&b).unwrap());
     }
 
     #[test]
