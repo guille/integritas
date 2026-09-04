@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
@@ -54,20 +55,24 @@ fn hash_tiny_file(file: &mut File, size: u64) -> io::Result<blake3::Hash> {
     Ok(blake3::hash(&data))
 }
 
+thread_local! {
+    /// Read buffer, zeroed once per thread rather than per file.
+    static BUF: RefCell<Vec<u8>> = RefCell::new(vec![0u8; BUF_SIZE]);
+}
+
 /// Hash a small file sequentially.
 fn hash_small_file(file: &mut File) -> io::Result<blake3::Hash> {
-    let mut hasher = blake3::Hasher::new();
-    let mut buf = [0u8; BUF_SIZE];
-
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
+    BUF.with_borrow_mut(|buf| {
+        let mut hasher = blake3::Hasher::new();
+        loop {
+            let n = file.read(buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
         }
-        hasher.update(&buf[..n]);
-    }
-
-    Ok(hasher.finalize())
+        Ok(hasher.finalize())
+    })
 }
 
 /// Hash a large file by memory-mapping it and hashing with BLAKE3's
