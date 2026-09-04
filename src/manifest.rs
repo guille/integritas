@@ -415,13 +415,13 @@ pub fn check_with_threads(
             Err(e) if e.kind() == io::ErrorKind::NotFound => (Status::Missing, None),
             Err(e) => return Err(e),
             Ok((hash, size)) => {
-                let hex = hash.to_hex().to_string();
-                let status = if hex == manifest.entries[rel].hash {
+                let hex = hash.to_hex();
+                let status = if hex.as_str() == manifest.entries[rel].hash {
                     Status::Ok
                 } else {
                     Status::Changed
                 };
-                (status, keep_hashes.then_some((hex, size)))
+                (status, keep_hashes.then(|| (hex.to_string(), size)))
             }
         };
         if let Some(pb) = progress {
