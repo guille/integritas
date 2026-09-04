@@ -225,31 +225,29 @@ fn hash_entry(
     ))
 }
 
+/// Run `f` in a rayon pool of exactly `threads` threads. Used even for one
+/// thread: `update_rayon` on a large file would otherwise fall through to the
+/// global pool and use every core regardless of `-j`.
+fn in_pool<T: Send>(threads: usize, f: impl FnOnce() -> io::Result<T> + Send) -> io::Result<T> {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    pool.install(f)
+}
+
 /// Hash a batch of files into manifest entries.
-/// Runs in a dedicated rayon pool when there is more than one file to hash.
 fn hash_all(
     files: &[(&Path, &str)],
     threads: usize,
     progress: Option<&ProgressBar>,
 ) -> io::Result<Vec<(String, ManifestEntry)>> {
-    if threads > 1 && files.len() > 1 {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .map_err(|e| io::Error::other(e.to_string()))?;
-
-        pool.install(|| {
-            files
-                .par_iter()
-                .map(|(abs, rel)| hash_entry(abs, rel, progress))
-                .collect()
-        })
-    } else {
+    in_pool(threads, || {
         files
-            .iter()
+            .par_iter()
             .map(|(abs, rel)| hash_entry(abs, rel, progress))
             .collect()
-    }
+    })
 }
 
 /// Append new files to an existing manifest without re-hashing known files.
@@ -432,24 +430,12 @@ pub fn check_with_threads(
         Ok(result)
     };
 
-    let results: Vec<(Status, Computed)> = if threads > 1 {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .map_err(|e| io::Error::other(e.to_string()))?;
-
-        pool.install(|| {
-            to_verify
-                .par_iter()
-                .map(|(rel, abs)| verify_one(rel, abs))
-                .collect::<io::Result<Vec<_>>>()
-        })?
-    } else {
+    let results: Vec<(Status, Computed)> = in_pool(threads, || {
         to_verify
-            .iter()
+            .par_iter()
             .map(|(rel, abs)| verify_one(rel, abs))
-            .collect::<io::Result<Vec<_>>>()?
-    };
+            .collect()
+    })?;
 
     let mut summary = VerifySummary {
         new: new_files,

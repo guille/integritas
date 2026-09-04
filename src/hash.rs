@@ -7,9 +7,8 @@ use crate::io_utils;
 /// Size of the read buffer (256 KiB).
 const BUF_SIZE: usize = 256 * 1024;
 
-/// Threshold above which we memory-map the file and hash with `update_rayon`
-/// (64 MiB). Below this, mmap/rayon overhead exceeds the benefit.
-const RAYON_THRESHOLD: u64 = 64 * 1024 * 1024;
+/// Threshold above which we memory-map the file and hash with `update_rayon`.
+const RAYON_THRESHOLD: u64 = 4 * 1024 * 1024; // 4 MiB
 
 /// Hash a file using BLAKE3 with a 256 KiB read buffer.
 /// Returns the hash and file size.
@@ -173,7 +172,7 @@ mod tests {
     #[test]
     fn test_hash_large_file_rayon() {
         // Exercise the mmap + rayon path directly — a 2 MB file would
-        // normally take the streaming path (threshold is 64 MiB).
+        // normally take the buffered path (threshold is 4 MiB).
         let data: Vec<u8> = (0..2_000_000u64)
             .map(|i| u8::try_from(i % 256).unwrap())
             .collect();
