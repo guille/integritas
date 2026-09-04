@@ -21,12 +21,78 @@ pub type PathMap<V> = HashMap<String, V, PathHasher>;
 pub type PathSet<'a> = HashSet<&'a str, PathHasher>;
 
 /// A single entry in the manifest.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ManifestEntry {
-    /// Hex-encoded BLAKE3 hash.
-    pub hash: String,
+    /// BLAKE3 hash; 64 hex characters in the file.
+    #[serde(with = "hex_hash")]
+    pub hash: blake3::Hash,
     /// File size in bytes.
     pub size: u64,
+}
+
+/// Hash as hex in the file, raw in memory: 32 bytes inline instead of a
+/// heap-allocated 64-byte `String` per entry.
+mod hex_hash {
+    use serde::{de, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(hash: &blake3::Hash, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(hash.to_hex().as_str())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<blake3::Hash, D::Error> {
+        struct Visitor;
+
+        impl de::Visitor<'_> for Visitor {
+            type Value = blake3::Hash;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a 64-character hex BLAKE3 hash")
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                decode(v).ok_or_else(|| E::invalid_value(de::Unexpected::Str(v), &self))
+            }
+        }
+
+        d.deserialize_str(Visitor)
+    }
+
+    const INVALID: u8 = 0xff;
+    const NIBBLE: [u8; 256] = {
+        let mut t = [INVALID; 256];
+        let mut c: u8 = 0;
+        loop {
+            t[c as usize] = match c {
+                b'0'..=b'9' => c - b'0',
+                b'a'..=b'f' => c - b'a' + 10,
+                b'A'..=b'F' => c - b'A' + 10,
+                _ => INVALID,
+            };
+            if c == 255 {
+                break;
+            }
+            c += 1;
+        }
+        t
+    };
+
+    /// Branchless table decode. `blake3::Hash::from_hex` matches and
+    /// early-returns per nibble, which measured slower than the JSON parse
+    /// around it.
+    fn decode(hex: &str) -> Option<blake3::Hash> {
+        let hex = hex.as_bytes();
+        if hex.len() != 64 {
+            return None;
+        }
+        let mut out = [0u8; 32];
+        let mut invalid = 0u8;
+        for (byte, pair) in out.iter_mut().zip(hex.chunks_exact(2)) {
+            let (hi, lo) = (NIBBLE[usize::from(pair[0])], NIBBLE[usize::from(pair[1])]);
+            invalid |= hi | lo;
+            *byte = (hi << 4) | lo;
+        }
+        (invalid & 0xf0 == 0).then(|| blake3::Hash::from_bytes(out))
+    }
 }
 
 /// Buffer for streaming the manifest out; `to_writer_pretty` issues many tiny
@@ -201,9 +267,9 @@ pub struct VerifySummary {
     pub changed: Vec<String>,
     pub missing: Vec<String>,
     pub new: Vec<String>,
-    /// Hashes of OK and CHANGED files (path -> (`hash_hex`, size)), so the
+    /// Hashes of OK and CHANGED files (path -> (hash, size)), so the
     /// manifest can be rebuilt without re-hashing. Empty unless requested.
-    pub computed_hashes: PathMap<(String, u64)>,
+    pub computed_hashes: PathMap<(blake3::Hash, u64)>,
 }
 
 /// Hash one file and build its manifest entry, ticking the progress bar.
@@ -216,13 +282,7 @@ fn hash_entry(
     if let Some(pb) = progress {
         pb.inc(1);
     }
-    Ok((
-        rel.to_string(),
-        ManifestEntry {
-            hash: hash.to_hex().to_string(),
-            size,
-        },
-    ))
+    Ok((rel.to_string(), ManifestEntry { hash, size }))
 }
 
 /// Run `f` in a rayon pool of exactly `threads` threads. Used even for one
@@ -287,7 +347,7 @@ pub fn compute_append(
     for f in &all_files {
         // If already in manifest, keep the existing entry
         if let Some(entry) = existing_entries.and_then(|entries| entries.get(&f.rel)) {
-            manifest.entries.insert(f.rel.clone(), entry.clone());
+            manifest.entries.insert(f.rel.clone(), *entry);
             continue;
         }
         // New file — needs hashing
@@ -374,7 +434,7 @@ fn unseen_entries(
 
 /// Verify with the specified number of threads.
 /// `keep_hashes` populates `VerifySummary::computed_hashes`; skip it when the
-/// manifest will not be rebuilt, as it costs two `String`s per file.
+/// manifest will not be rebuilt, as it costs a map entry per file.
 pub fn check_with_threads(
     root_dir: &Path,
     manifest: &Manifest,
@@ -408,20 +468,19 @@ pub fn check_with_threads(
         Changed,
         Missing,
     }
-    type Computed = Option<(String, u64)>;
+    type Computed = Option<(blake3::Hash, u64)>;
 
     let verify_one = |rel: &str, abs: &PathBuf| -> io::Result<(Status, Computed)> {
         let result = match hash_file_with_advise(abs, true) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => (Status::Missing, None),
             Err(e) => return Err(e),
             Ok((hash, size)) => {
-                let hex = hash.to_hex();
-                let status = if hex.as_str() == manifest.entries[rel].hash {
+                let status = if hash == manifest.entries[rel].hash {
                     Status::Ok
                 } else {
                     Status::Changed
                 };
-                (status, keep_hashes.then(|| (hex.to_string(), size)))
+                (status, keep_hashes.then_some((hash, size)))
             }
         };
         if let Some(pb) = progress {
@@ -497,7 +556,7 @@ pub fn build_updated_manifest(
         m.entries.insert(
             path.clone(),
             ManifestEntry {
-                hash: hash.clone(),
+                hash: *hash,
                 size: *size,
             },
         );
@@ -575,7 +634,7 @@ mod tests {
     fn test_compute_correct_hash() {
         let dir = create_test_dir();
         let manifest = compute(dir.path()).unwrap();
-        let expected = crate::hash::hash_bytes(b"hello").to_hex().to_string();
+        let expected = crate::hash::hash_bytes(b"hello");
         assert_eq!(manifest.entries["file1.txt"].hash, expected);
     }
 
@@ -819,7 +878,7 @@ mod tests {
             entries.insert(
                 key.clone(),
                 ManifestEntry {
-                    hash: String::new(),
+                    hash: blake3::Hash::from_bytes([0; 32]),
                     size: 0,
                 },
             );
@@ -1063,7 +1122,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
 
         let entry = |i: u32| ManifestEntry {
-            hash: format!("{i:064x}"),
+            hash: blake3::hash(i.to_string().as_bytes()),
             size: u64::from(i),
         };
 
@@ -1239,11 +1298,34 @@ mod tests {
         assert!(!updated.entries.contains_key("file2.txt")); // missing = removed
 
         // Verify the changed file has the new hash
-        let expected_hash = crate::hash::hash_bytes(b"modified").to_hex().to_string();
+        let expected_hash = crate::hash::hash_bytes(b"modified");
         assert_eq!(updated.entries["file1.txt"].hash, expected_hash);
 
         // Verify the new file was hashed correctly
-        let expected_new = crate::hash::hash_bytes(b"brand new").to_hex().to_string();
+        let expected_new = crate::hash::hash_bytes(b"brand new");
         assert_eq!(updated.entries["new_file.txt"].hash, expected_new);
+    }
+
+    #[test]
+    fn test_hash_hex_roundtrip_and_rejects_invalid() {
+        let hash = crate::hash::hash_bytes(b"x");
+        let entry = ManifestEntry { hash, size: 1 };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains(hash.to_hex().as_str()));
+        assert_eq!(serde_json::from_str::<ManifestEntry>(&json).unwrap(), entry);
+
+        let upper = format!(r#"{{"hash":"{}","size":1}}"#, hash.to_hex().to_uppercase());
+        assert_eq!(
+            serde_json::from_str::<ManifestEntry>(&upper).unwrap(),
+            entry
+        );
+
+        for bad in ["", "zz", &"0".repeat(63), &"0".repeat(65), &"g".repeat(64)] {
+            let json = format!(r#"{{"hash":"{bad}","size":1}}"#);
+            assert!(
+                serde_json::from_str::<ManifestEntry>(&json).is_err(),
+                "{bad:?}"
+            );
+        }
     }
 }

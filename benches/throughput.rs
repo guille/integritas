@@ -78,7 +78,7 @@ fn synthetic_manifest(n: usize) -> Manifest {
             (i / 32) % 128,
             i
         );
-        let hash = blake3::hash(path.as_bytes()).to_hex().to_string();
+        let hash = blake3::hash(path.as_bytes());
         m.entries.insert(
             path,
             ManifestEntry {
@@ -183,7 +183,7 @@ fn bench_manifest_lookup(c: &mut Criterion) {
             b.iter(|| {
                 let mut total = 0usize;
                 for k in &keys {
-                    total += manifest.entries[k.as_str()].hash.len();
+                    total += usize::from(manifest.entries[k.as_str()].hash.as_bytes()[0]);
                 }
                 black_box(total)
             });
