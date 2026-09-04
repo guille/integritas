@@ -86,8 +86,9 @@ mod hex_hash {
         }
         let mut out = [0u8; 32];
         let mut invalid = 0u8;
-        for (byte, pair) in out.iter_mut().zip(hex.chunks_exact(2)) {
-            let (hi, lo) = (NIBBLE[usize::from(pair[0])], NIBBLE[usize::from(pair[1])]);
+        let (pairs, _) = hex.as_chunks::<2>();
+        for (byte, &[hi_c, lo_c]) in out.iter_mut().zip(pairs) {
+            let (hi, lo) = (NIBBLE[usize::from(hi_c)], NIBBLE[usize::from(lo_c)]);
             invalid |= hi | lo;
             *byte = (hi << 4) | lo;
         }
