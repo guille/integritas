@@ -645,9 +645,9 @@ mod tests {
         let manifest = compute(dir.path()).unwrap();
         let summary = check(dir.path(), &manifest).unwrap();
         assert_eq!(summary.ok, 3);
-        assert!(summary.changed.is_empty());
-        assert!(summary.missing.is_empty());
-        assert!(summary.new.is_empty());
+        assert_eq!(summary.changed, Vec::<String>::new());
+        assert_eq!(summary.missing, Vec::<String>::new());
+        assert_eq!(summary.new, Vec::<String>::new());
     }
 
     #[test]
@@ -760,7 +760,7 @@ mod tests {
         // Add a .tmp file — should NOT be reported as NEW
         fs::write(dir.path().join("scratch.tmp"), b"temp").unwrap();
         let summary = check(dir.path(), &manifest).unwrap();
-        assert!(summary.new.is_empty());
+        assert_eq!(summary.new, Vec::<String>::new());
         assert_eq!(summary.ok, 3);
     }
 
@@ -796,9 +796,9 @@ mod tests {
         let m = compute(dir.path()).unwrap();
         let summary = diff(&m, &m);
         assert_eq!(summary.unchanged, 3);
-        assert!(summary.changed.is_empty());
-        assert!(summary.added.is_empty());
-        assert!(summary.removed.is_empty());
+        assert_eq!(summary.changed, Vec::<String>::new());
+        assert_eq!(summary.added, Vec::<String>::new());
+        assert_eq!(summary.removed, Vec::<String>::new());
     }
 
     #[test]
@@ -846,7 +846,7 @@ mod tests {
         manifest.exclude_patterns.push("file1.txt".to_string());
         let summary = check(dir.path(), &manifest).unwrap();
         assert_eq!(summary.ok, 3);
-        assert!(summary.missing.is_empty());
+        assert_eq!(summary.missing, Vec::<String>::new());
 
         // A hidden entry that actually changed is still caught.
         fs::write(dir.path().join("file1.txt"), b"modified").unwrap();
@@ -918,7 +918,7 @@ mod tests {
     fn test_unseen_entries_on_empty_manifest() {
         let root = Path::new("/root");
         let entries = entry_map(&[]);
-        assert!(unseen_entries(&[], &entries, root).is_empty());
+        assert_eq!(unseen_entries(&[], &entries, root), Vec::new());
     }
 
     #[test]
@@ -945,8 +945,8 @@ mod tests {
         let summary = check(dir.path(), &manifest).unwrap();
         assert_eq!(summary.ok, 3);
         assert_eq!(summary.new, vec!["extra.txt"]);
-        assert!(summary.missing.is_empty());
-        assert!(summary.changed.is_empty());
+        assert_eq!(summary.missing, Vec::<String>::new());
+        assert_eq!(summary.changed, Vec::<String>::new());
     }
 
     #[test]
@@ -958,7 +958,7 @@ mod tests {
         let summary = check(dir.path(), &manifest).unwrap();
         assert_eq!(summary.ok, 2);
         assert_eq!(summary.changed, vec!["file1.txt"]);
-        assert!(summary.missing.is_empty());
+        assert_eq!(summary.missing, Vec::<String>::new());
     }
 
     #[test]
@@ -1008,8 +1008,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let summary = check(dir.path(), &Manifest::new()).unwrap();
         assert_eq!(summary.ok, 0);
-        assert!(summary.missing.is_empty());
-        assert!(summary.new.is_empty());
+        assert_eq!(summary.missing, Vec::<String>::new());
+        assert_eq!(summary.new, Vec::<String>::new());
     }
 
     #[test]
@@ -1018,7 +1018,7 @@ mod tests {
         let summary = check(dir.path(), &Manifest::new()).unwrap();
         assert_eq!(summary.ok, 0);
         assert_eq!(summary.new.len(), 3);
-        assert!(summary.missing.is_empty());
+        assert_eq!(summary.missing, Vec::<String>::new());
     }
 
     #[test]
@@ -1032,7 +1032,7 @@ mod tests {
         let summary = check(dir.path(), &manifest).unwrap();
         assert_eq!(summary.ok, 0);
         assert_eq!(summary.missing.len(), 3);
-        assert!(summary.new.is_empty());
+        assert_eq!(summary.new, Vec::<String>::new());
     }
 
     #[test]
@@ -1045,7 +1045,7 @@ mod tests {
         let summary = check(dir.path(), &manifest).unwrap();
         assert_eq!(summary.ok, 3);
         assert_eq!(summary.new, vec!["extra.txt"]);
-        assert!(summary.missing.is_empty());
+        assert_eq!(summary.missing, Vec::<String>::new());
     }
 
     #[test]
