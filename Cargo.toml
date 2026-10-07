@@ -9,6 +9,7 @@ harness = false
 name    = "throughput"
 
 [dependencies]
+base64     = "0.23.1"
 blake3     = { version = "1", features = ["rayon"] }
 chrono     = { version = "0.4", features = ["serde"] }
 clap       = { version = "4", features = ["derive"] }

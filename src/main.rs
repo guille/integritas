@@ -7,6 +7,8 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+mod status;
+
 #[derive(Parser)]
 #[command(
     name = "integritas",
@@ -148,12 +150,33 @@ impl<T, E: Display> Context<T> for Result<T, E> {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if let Some(title) = status_title(&cli.command) {
+        status::init(title);
+    }
     match run(cli.command) {
         Ok(code) => code,
         Err(e) => {
+            status::error(&e.to_string());
             eprintln!("Error: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Label for terminal status reports, or `None` for commands that don't report.
+fn status_title(command: &Commands) -> Option<String> {
+    match command {
+        Commands::Compute {
+            directory,
+            quiet: false,
+            ..
+        } => Some(format!("compute {}", directory.display())),
+        Commands::Check {
+            directory,
+            quiet: false,
+            ..
+        } => Some(format!("check {}", directory.display())),
+        _ => None,
     }
 }
 
@@ -236,7 +259,9 @@ fn cmd_compute(
             None
         };
         let pb = make_spinner(quiet);
+        let tracker = status::track(&pb);
         let result = manifest::compute_append(dir, existing.as_ref(), threads, exclude, Some(&pb));
+        drop(tracker);
         pb.finish_and_clear();
         result.context("computing hashes")?
     } else {
@@ -247,7 +272,9 @@ fn cmd_compute(
             );
         }
         let pb = make_spinner(quiet);
+        let tracker = status::track(&pb);
         let result = manifest::compute_with_threads(dir, threads, Some(&pb), exclude);
+        drop(tracker);
         pb.finish_and_clear();
         result.context("computing hashes")?
     };
@@ -262,6 +289,7 @@ fn cmd_compute(
             out_path.display()
         );
     }
+    status::done(&format!("{count} files hashed"));
     Ok(ExitCode::SUCCESS)
 }
 
@@ -311,10 +339,11 @@ fn cmd_check(
         pb
     };
 
-    let summary = manifest::check_with_threads(dir, &m, threads, Some(&pb), prompt || accept_new)
-        .inspect_err(|_| pb.finish_and_clear())
-        .context("during verification")?;
+    let tracker = status::track(&pb);
+    let summary = manifest::check_with_threads(dir, &m, threads, Some(&pb), prompt || accept_new);
+    drop(tracker);
     pb.finish_and_clear();
+    let summary = summary.context("during verification")?;
 
     for path in &summary.changed {
         println!("CHANGED: {path}");
@@ -356,6 +385,7 @@ fn cmd_check(
         manifest_updated = true;
     } else if prompt && has_differences {
         ensure_rewritable(&m, &mpath)?;
+        status::question();
         eprint!("\nUpdate manifest to reflect current state? [y/N] ");
         let _ = std::io::stderr().flush();
         let mut input = String::new();
@@ -370,7 +400,29 @@ fn cmd_check(
         eprintln!("--accept-new: manifest not updated (differences beyond new files).");
     }
 
+    if has_differences && !manifest_updated {
+        status::error(&differences_msg(&summary));
+    } else if manifest_updated {
+        status::done("manifest updated");
+    } else {
+        status::done(&format!("{} files OK", summary.ok));
+    }
+
     Ok(check_exit_code(has_differences, manifest_updated))
+}
+
+/// E.g. "2 changed, 1 new", omitting empty kinds.
+fn differences_msg(summary: &manifest::VerifySummary) -> String {
+    [
+        (summary.changed.len(), "changed"),
+        (summary.missing.len(), "missing"),
+        (summary.new.len(), "new"),
+    ]
+    .iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(n, kind)| format!("{n} {kind}"))
+    .collect::<Vec<_>>()
+    .join(", ")
 }
 
 /// True when new files are the only kind of difference found.
@@ -400,10 +452,11 @@ fn save_updated_manifest(
     quiet: bool,
 ) -> Result<(), AppError> {
     let pb = make_spinner(quiet);
-    let updated = manifest::build_updated_manifest(dir, summary, old, threads, Some(&pb))
-        .inspect_err(|_| pb.finish_and_clear())
-        .context("updating manifest")?;
+    let tracker = status::track(&pb);
+    let updated = manifest::build_updated_manifest(dir, summary, old, threads, Some(&pb));
+    drop(tracker);
     pb.finish_and_clear();
+    let updated = updated.context("updating manifest")?;
     let count = updated.entries.len();
     updated
         .save(mpath)
