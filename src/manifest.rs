@@ -325,9 +325,7 @@ pub fn compute_append(
     let threads = threads.max(1);
 
     // Merge excludes: keep existing manifest's excludes + new CLI excludes
-    let mut final_excludes: Vec<String> = existing
-        .map(|m| m.exclude_patterns.clone())
-        .unwrap_or_default();
+    let mut final_excludes: Vec<String> = existing.map_or_default(|m| m.exclude_patterns.clone());
     for pat in excludes {
         if !final_excludes.contains(pat) {
             final_excludes.push(pat.clone());
